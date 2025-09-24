@@ -1,0 +1,75 @@
+#!/bin/bash
+#SBATCH --time=600
+#SBATCH --job-name=explore_sae_features
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --account=cai_nlp
+#SBATCH --partition=gpu_ia
+#SBATCH --output=/cluster/home/mlynckat/log/%j_%N_ex06_venv.out
+#SBATCH --error=/cluster/home/mlynckat/log/%j_%N_ex06_venv.err
+
+env_name="mi_venv"
+alt_env_name="sae_venv"
+venv_base_dir="/raid/persistent_scratch/mlynckat/venvs/"
+venv_path="$venv_base_dir/$env_name"
+alt_venv_path="$venv_base_dir/$alt_env_name"
+
+# create venv base dir if it does not exist
+mkdir -p /raid/persistent_scratch/mlynckat/venvs/
+
+# Check if the virtual environment exists
+if [ -d "$venv_path" ]; then
+    echo "Virtual environment ($env_name) found. Activating..."
+    source "$venv_path/bin/activate"
+elif [ -d "$alt_venv_path" ]; then
+    echo "Virtual environment ($alt_env_name) found. Activating..."
+    source "$alt_venv_path/bin/activate"
+else
+    echo "Virtual environment ($env_name) not found. Creating..."
+    module load python/3.12.4
+    virtualenv $venv_path
+    unset PIP_TARGET
+    unset PYTHONPATH
+    source "$venv_path/bin/activate"
+fi
+
+# read requirements.txt file and store valid packages into list
+declare -A packages
+while IFS= read -r line || [ -n "$line" ]; do
+    # Strip comments from the line
+    line="${line%%#*}"
+    # Remove trailing spaces
+    line="${line%"${line##*[![:space:]]}"}"
+    # Skip empty lines
+    [[ -z "$line" ]] && continue
+    # Split the line into package and version if it matches the pattern package==version
+    if [[ "$line" =~ ^[a-zA-Z0-9_(\-\.)]+==([1-9][0-9]*!)?(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))*((a|b|rc)(0|[1-9][0-9]*))?(\.post(0|[1-9][0-9]*))?(\.dev(0|[1-9][0-9]*))?$ ]]; then
+        IFS='==' read -r package version <<< "${line/==/==}"
+        # Remove leading = from version
+        version=${version#=}
+        # Add the package and version to the associative array
+        packages[$package]=$version
+    else
+        echo "Ignoring invalid line: $line"
+    fi
+done < /cluster/home/mlynckat/mechanistic_interpretability_master/backend/requirements.txt
+
+# Check if the correct package versions are installed:
+for package in "${!packages[@]}"; do
+    version=${packages[$package]}
+    installed_version=$(pip3 show $package | grep "Version:" | cut -d' ' -f2)
+    if [ -z "$installed_version" ]; then
+        echo "Installing $package==$version..."
+        pip3 install "$package==$version"
+    elif [ "$installed_version" != "$version" ]; then
+        echo "$package is installed but version $installed_version is not the required version $version. Updating..."
+        pip3 install "$package==$version"
+    fi
+done
+
+# run the workload
+python3 -m backend.src.analysis.sae_activations_exploration
+
+# submit the job:
+# sbatch <path-to-submit-file>/venv_script.submit

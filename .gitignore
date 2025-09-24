@@ -1,0 +1,127 @@
+# Data directories
+data/
+
+# Model files and checkpoints
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.ckpt
+checkpoints/
+models/
+weights/
+saved_models/
+
+# Output and results directories
+output/
+outputs/
+results/
+experiments/
+runs/
+logs/
+log/
+*.log
+*.out
+*.err
+
+# Cache directories
+cache/
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Environment files
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Frontend dependencies and build
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.next/
+out/
+build/
+dist/
+
+# Python virtual environments
+.conda/
+.pyenv/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Large files and datasets (common ML patterns)
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.parquet
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.mat
+
+# Configuration files with secrets
+config.json
+secrets.json
+.secrets
+credentials.json
+
+# Docker
+.dockerignore
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Slurm job files
+slurm-*.out
+*.submit.out
