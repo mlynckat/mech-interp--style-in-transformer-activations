@@ -55,26 +55,43 @@ def parse_filenames(filenames):
 
     for filename in filenames:
         filename_stem = Path(filename).stem
-        parts = filename_stem.split('_')
         
         # Handle different filename patterns
         if 'non_zeroes_count' in filename:
-            # Pattern: non_zeroes_count_google_gemma-2-2b_att_activations_author_layer_ind.npy
+            # Legacy pattern: non_zeroes_count_google_gemma-2-2b_att_activations_author_layer_ind.npy
+            parts = filename_stem.split('_')
             layer_type = parts[-5]  # att, mlp, res
             author = parts[-3]   # author name
             layer_ind = parts[-1]      # layer number
             files_structure[layer_type][layer_ind][author] = filename
+        elif 'activations' in filename:
+            # New pattern: sae_baseline__google_gemma-2-9b__res__activations__bush__layer_0
+            # Handle both .npz and .sparse.npz extensions
+            if filename.endswith('.sparse.npz'):
+                filename_stem = filename_stem[:-7]  # Remove .sparse from stem
+            parts = filename_stem.split('__')
+            if len(parts) >= 6:
+                layer_type = parts[2]  # res, mlp, att
+                author = parts[4]      # author name
+                layer_part = parts[5]  # layer_0
+                layer_ind = layer_part.split('_')[1]  # Extract number from layer_X
+                files_structure[layer_type][layer_ind][author] = filename
         elif 'entropy' in filename and 'cross_entropy' not in filename:
-            # Pattern: sae_google_gemma-2-2b_entropy_loss_author.npy or sae_google_gemma-2-2b_crossentropy_loss_author.npy
-            author = parts[-1]
-            files_structure['entropy'][author][filename] = filename
+            # New pattern: sae_baseline__google_gemma-2-9b__entropy__bush.npy
+            parts = filename_stem.split('__')
+            if len(parts) >= 4:
+                author = parts[-1]  # author name
+                files_structure['entropy'][author][filename] = filename
         elif 'cross_entropy' in filename:
-            # Pattern: sae_google_gemma-2-2b_cross_entropy_loss_author.npy
-            author = parts[-1]
-            files_structure['cross_entropy'][author][filename] = filename
+            # New pattern: sae_baseline__google_gemma-2-9b__cross_entropy_loss__bush.npy
+            parts = filename_stem.split('__')
+            if len(parts) >= 4:
+                author = parts[-1]  # author name
+                files_structure['cross_entropy'][author][filename] = filename
         elif filename.endswith('.csv'):
             # CSV files for detailed scatter
             # Pattern: frequencies_activated_per_feature_att_0.csv
+            parts = filename_stem.split('_')
             if len(parts) >= 4:
                 layer_type = parts[-2]  # att, mlp, res
                 layer_ind = parts[-1]   # layer number

@@ -3,23 +3,25 @@ import os
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
+import scipy.sparse as sp
 from dataclasses import dataclass
 import logging
 
 import json
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import LabelBinarizer
 from sklearn.feature_selection import VarianceThreshold
-from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.feature_selection import SequentialFeatureSelector
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_validate, train_test_split, ShuffleSplit
 import pandas as pd
 from sklearn.metrics import classification_report
 
+
+"""from cuml.common import logger;
+logger.set_level(logger.level_enum.info)"""
 
 # Import shared utilities
 from backend.src.utils.shared_utilities import (
@@ -31,25 +33,26 @@ from backend.src.utils.shared_utilities import (
 logger = logging.getLogger(__name__)
 
 
+
 def parse_arguments():
     """Parse arguments for feature importance analysis"""
     parser = argparse.ArgumentParser(description="SAE Feature Importance Analysis Tool")
     parser.add_argument(
         "--path_to_data",
         type=str,
-        default="data/raw_features/AuthorMixPolitics500canonical-2b",
+        default="data/raw_features/news/politics/google_gemma-2-9b/politics_500",
         help="Directory containing raw features"
     )
     parser.add_argument(
         "--path_to_outputs",
         type=str,
-        default="data/output_data",
+        default="data/output_data/news/politics/google_gemma-2-9b/",
         help="Output directory for results"
     )
     parser.add_argument(
         "--run_name",
         type=str,
-        default="feature_selection_politics_500_2b",
+        default="politics_500",
         help="The name of the run to create a folder in outputs"
     )
     parser.add_argument(
@@ -81,6 +84,12 @@ def parse_arguments():
         choices=["prompted", "baseline"],
         help="The prompted to include in the analysis"
     )
+    parser.add_argument(
+        "--from_token",
+        type=int,
+        default=10,
+        help="The token to start from"
+    )
     
     args = parser.parse_args()
 
@@ -88,12 +97,12 @@ def parse_arguments():
 
 @dataclass
 class FeaturesData:
-    train_data: np.ndarray
-    test_data: np.ndarray
+    train_data: sp.csr_matrix  # Changed to sparse matrix
+    test_data: sp.csr_matrix   # Changed to sparse matrix
     train_labels: np.ndarray
     test_labels: np.ndarray
-    train_token_indices: np.ndarray
-    test_token_indices: np.ndarray
+    train_metadata: dict = None  # Added metadata tracking
+    test_metadata: dict = None   # Added metadata tracking
 
 class FeatureSelectionForClassification:
     def __init__(self):
@@ -103,33 +112,79 @@ class FeatureSelectionForClassification:
         """Run feature selection"""
         pass
 
+    def print_stats_of_train_data(self, features_data=None):
+        """Print stats of train data to check that the data is being transformed correctly"""
+
+        if features_data is None:
+            features_data = self.features_data
+        
+        logger.info(f"Train data shape: {features_data.train_data.shape}")
+        logger.info(f"Train data sparsity: {1 - features_data.train_data.nnz / (features_data.train_data.shape[0] * features_data.train_data.shape[1]):.4f}")
+        logger.info(f"Train data non-zero elements: {features_data.train_data.nnz}")
+        logger.info(f"Train data non-zero elements per row: {features_data.train_data.nnz / features_data.train_data.shape[0]:.4f}")
+        logger.info(f"Train data non-zero elements per col: {features_data.train_data.nnz / features_data.train_data.shape[1]:.4f}")
+        logger.info(f"Train data labels shape: {features_data.train_labels.shape}")
+        logger.info(f"Train data labels sum: {features_data.train_labels.sum()}")
+
+        # Get the indptr array
+        indptr = features_data.train_data.indptr
+
+        # Calculate the number of non-zeros per row
+        num_nonzeros_per_row = np.diff(indptr)
+
+        # Find the index of the all-zero row
+        zero_row_indices = np.where(num_nonzeros_per_row == 0)[0]
+
+        logger.info(f"All-zero row(s): {len(zero_row_indices)}")
+
 class VarianceThresholdFeatureSelection(FeatureSelectionForClassification):
     def __init__(self, features_data: FeaturesData, threshold=0.01):
         self.threshold = threshold
         self.features_data = features_data
 
     def run_feature_selection(self):
-        """Run feature selection"""
-        logger.info(f"Applying VarianceThreshold")
+        """Run feature selection on sparse matrices"""
+        logger.info(f"Applying VarianceThreshold on sparse matrix with threshold {self.threshold}")
+        
+        # VarianceThreshold works with sparse matrices
         variance_threshold = VarianceThreshold(threshold=self.threshold)
         train_activations_reduced = variance_threshold.fit_transform(self.features_data.train_data)
 
-        logger.info(f"VarianceThreshold selected {train_activations_reduced.shape[1]} features")
-        most_important_features_author = variance_threshold.get_feature_names_out()
-        logger.debug(f"VarianceThreshold features: {most_important_features_author}") 
+        logger.info(f"VarianceThreshold selected {train_activations_reduced.shape[1]} features from {self.features_data.train_data.shape[1]}")
+        most_important_features_author = list(variance_threshold.get_feature_names_out())
+        logger.debug(f"VarianceThreshold features: {most_important_features_author[:10]}...") 
 
-        non_zero_doctok_indices = np.argwhere(train_activations_reduced.sum(axis=1) > 0)[:, 0]
-        train_activations_reduced = train_activations_reduced[non_zero_doctok_indices]
+        # For sparse matrices, use different approach to find non-zero rows
+        if sp.issparse(train_activations_reduced):
+            non_zero_doctok_indices = np.diff(train_activations_reduced.indptr).nonzero()[0]
+        else:
+            non_zero_doctok_indices = np.argwhere(train_activations_reduced.sum(axis=1) > 0)[:, 0]
+        
+        train_activations_reduced = train_activations_reduced[non_zero_doctok_indices, :]
         train_labels_one_vs_all = self.features_data.train_labels[non_zero_doctok_indices]
-        train_token_indices_reduced = self.features_data.train_token_indices[non_zero_doctok_indices]
 
+        # Apply same transformation to test data
         test_activations_reduced = variance_threshold.transform(self.features_data.test_data)
-        non_zero_doctok_indices_test = np.argwhere(test_activations_reduced.sum(axis=1) > 0)[:, 0]
-        test_activations_reduced = test_activations_reduced[non_zero_doctok_indices_test]
+        if sp.issparse(test_activations_reduced):
+            non_zero_doctok_indices_test = np.diff(test_activations_reduced.indptr).nonzero()[0]
+        else:
+            non_zero_doctok_indices_test = np.argwhere(test_activations_reduced.sum(axis=1) > 0)[:, 0]
+        
+        test_activations_reduced = test_activations_reduced[non_zero_doctok_indices_test, :]
         test_labels_one_vs_all = self.features_data.test_labels[non_zero_doctok_indices_test]
-        test_token_indices_reduced = self.features_data.test_token_indices[non_zero_doctok_indices_test]
 
-        out = FeaturesData(train_data=train_activations_reduced, test_data=test_activations_reduced, train_labels=train_labels_one_vs_all, test_labels=test_labels_one_vs_all, train_token_indices=train_token_indices_reduced, test_token_indices=test_token_indices_reduced)
+        logger.info(f"After removing zero-activation rows: train {train_activations_reduced.shape}, test {test_activations_reduced.shape}")
+
+        out = FeaturesData(
+            train_data=train_activations_reduced, 
+            test_data=test_activations_reduced, 
+            train_labels=train_labels_one_vs_all, 
+            test_labels=test_labels_one_vs_all, 
+            train_metadata=self.features_data.train_metadata,
+            test_metadata=self.features_data.test_metadata
+        )
+
+        self.print_stats_of_train_data(out)
 
         return out, most_important_features_author
 
@@ -141,188 +196,252 @@ class SelectKBestFeatureSelection(FeatureSelectionForClassification):
         self.k = k
 
     def run_feature_selection(self):
-        """Run feature selection"""
+        """Run feature selection on sparse matrices"""
         # Apply SelectKBest on features chosen with VarianceThreshold
         select_k_best = SelectKBest(self.approach, k=self.k)
-        logger.info(f"Fitting SelectKBest")
+        logger.info(f"Fitting SelectKBest with k={self.k} on sparse matrix")
+        
+        # SelectKBest works with sparse matrices
         train_data_reduced = select_k_best.fit_transform(self.features_data.train_data, self.features_data.train_labels)
-        current_feature_names = train_data_reduced.get_feature_names_out()
+        current_feature_names = select_k_best.get_feature_names_out()
+        # Map back to original feature indices through the inherited feature list
         original_feature_names = [self.inherited_features_from_previous_step[int(i.replace("x", ""))] for i in current_feature_names]
         logger.debug(f"SelectKBest features: {original_feature_names}")
 
         test_data_reduced = select_k_best.transform(self.features_data.test_data)
-        out = FeaturesData(train_data=train_data_reduced, test_data=test_data_reduced, train_labels=self.features_data.train_labels, test_labels=self.features_data.test_labels, train_token_indices=self.features_data.train_token_indices, test_token_indices=self.features_data.test_token_indices)
+        
+        out = FeaturesData(
+            train_data=train_data_reduced, 
+            test_data=test_data_reduced, 
+            train_labels=self.features_data.train_labels, 
+            test_labels=self.features_data.test_labels, 
+            train_metadata=self.features_data.train_metadata,
+            test_metadata=self.features_data.test_metadata
+        )
+        self.print_stats_of_train_data(out)
         return out, original_feature_names
 
-class SequentialFeatureSelector(FeatureSelectionForClassification):
+class FeatureSelectionSequential(FeatureSelectionForClassification):
     def __init__(self, features_data: FeaturesData, inherited_features_from_previous_step, approach=LogisticRegression(), k=10):
         self.inherited_features_from_previous_step = inherited_features_from_previous_step
         self.approach = approach
         self.features_data = features_data
         self.k = k
-        self.approach = approach
 
     def run_feature_selection(self):
-        """Run feature selection"""
-        # Apply SequentialFeatureSelector
+        """Run feature selection on sparse matrices"""
+        # Apply SequentialFeatureSelector - works with sparse matrices if the estimator does
         sequential_feature_selector = SequentialFeatureSelector(self.approach, n_features_to_select=self.k, n_jobs=-1)
-        logger.info(f"Applying SequentialFeatureSelector..")
+        logger.info(f"Applying SequentialFeatureSelector with k={self.k} on sparse matrix")
+        
         train_data_reduced = sequential_feature_selector.fit_transform(self.features_data.train_data, self.features_data.train_labels.ravel())
 
         current_feature_names = sequential_feature_selector.get_feature_names_out()
+        # Map back to original feature indices through the inherited feature list
         original_feature_names = [self.inherited_features_from_previous_step[int(i.replace("x", ""))] for i in current_feature_names]
         logger.debug(f"SequentialFeatureSelector features: {original_feature_names}")
 
         test_data_reduced = sequential_feature_selector.transform(self.features_data.test_data)
-        out = FeaturesData(train_data=train_data_reduced, test_data=test_data_reduced, train_labels=self.features_data.train_labels, test_labels=self.features_data.test_labels, train_token_indices=self.features_data.train_token_indices, test_token_indices=self.features_data.test_token_indices)
+        
+        out = FeaturesData(
+            train_data=train_data_reduced, 
+            test_data=test_data_reduced, 
+            train_labels=self.features_data.train_labels, 
+            test_labels=self.features_data.test_labels, 
+            train_metadata=self.features_data.train_metadata,
+            test_metadata=self.features_data.test_metadata
+        )
+        self.print_stats_of_train_data(out)
         
         return out, original_feature_names
 
         
 
 def save_histogram_of_data(data, save_path):
-    """Save histogram of data"""
-    zero_count = np.sum(data == 0)
-    data = data[data > 0]
+    """Save histogram of data - handles both sparse and dense matrices"""
+    if sp.issparse(data):
+        # For sparse matrices, get non-zero data
+        non_zero_data = data.data
+        zero_count = data.shape[0] * data.shape[1] - data.nnz
+    else:
+        # For dense matrices
+        zero_count = np.sum(data == 0)
+        non_zero_data = data[data > 0]
+    
     plt.figure(figsize=(12, 8))
-    plt.hist(data, bins=100)
-    plt.title(f"Histogram of raw activations data for {save_path.split('.')[0]}. {zero_count} tokens with no activations")
+    if len(non_zero_data) > 0:
+        plt.hist(non_zero_data, bins=100)
+    plt.title(f"Histogram of raw activations data for {save_path.split('.')[0]}. {zero_count} zero activations")
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-def retrieve_and_combine_author_data(author_filename_dict, path_to_data, binary=True):
-    """Retrieve and combine author data"""
+def save_updated_metadata(metadata, save_path, description=""):
+    """Save updated metadata after filtering operations"""
+    metadata_to_save = {
+        'description': f"Filtered metadata: {description}",
+        'n_samples': len(metadata['doc_ids']),
+        'n_unique_docs': len(np.unique(metadata['doc_ids'])),
+        'n_unique_authors': len(np.unique(metadata['author_ids'])),
+        'doc_ids': metadata['doc_ids'].tolist(),
+        'tok_ids': metadata['tok_ids'].tolist(),
+        'author_ids': metadata['author_ids'].tolist(),
+        'valid_mask': metadata['valid_mask'].tolist()
+    }
+    
+    with open(save_path, 'w') as f:
+        json.dump(metadata_to_save, f, indent=2)
+    
+    logger.info(f"Saved updated metadata to {save_path}")
+    logger.info(f"  Samples: {metadata_to_save['n_samples']}")
+    logger.info(f"  Unique docs: {metadata_to_save['n_unique_docs']}")
+    logger.info(f"  Unique authors: {metadata_to_save['n_unique_authors']}")
 
-    train_activations = []
-    test_activations = []
+def retrieve_and_combine_author_data(author_filename_dict, path_to_data, binary=True, from_token=0):
+    """Retrieve and combine author data using sparse matrices and proper metadata handling"""
+
+    train_activations_list = []
+    test_activations_list = []
 
     train_labels = []
     test_labels = []
-
-    # Initialize train and test token indices to track token positions (author_ind,doc_ind, tok_in_seq_ind)
-    train_token_indices = []
-    test_token_indices = []
+    
+    # Track metadata for proper document/token position mapping
+    train_metadata = {'doc_ids': [], 'tok_ids': [], 'valid_mask': [], 'author_ids': []}
+    test_metadata = {'doc_ids': [], 'tok_ids': [], 'valid_mask': [], 'author_ids': []}
 
     int_to_author = {}
+    n_features = None
 
     for author_ind, (author, filename) in enumerate(author_filename_dict.items()):
         int_to_author[author_ind] = author
         logger.info(f"Loading data for author {author_ind} {author} from {filename}")
-        metadata, data = DataLoader().load_sae_activations(Path(path_to_data) / filename)
-        doc_lengths = metadata.tokens_per_doc
+        
+        # Load sparse activation data
+        data, metadata = DataLoader().load_sae_activations(Path(path_to_data) / filename)
+        
+        if n_features is None:
+            n_features = data.shape[2] if len(data.shape) == 3 else data.shape[1]
+        
+        # Get document lengths from metadata
+        if hasattr(metadata, 'doc_lengths'):
+            doc_lengths = metadata.doc_lengths
+        else:
+            raise ValueError(f"Doc lengths not found in metadata for {filename}. Possibly old files are used")
 
         n_docs = len(doc_lengths)
         n_docs_train = int(n_docs * 0.8)
         
-        for i in range(len(doc_lengths)):
-            if i < n_docs_train:
-                train_activations.extend(data[i, :doc_lengths[i], :].reshape((-1, data.shape[2])))
-                train_token_indices.extend([(author_ind, i, j) for j in range(doc_lengths[i])])
-                train_labels.extend([author_ind] * doc_lengths[i])
-            else:
-                test_activations.extend(data[i, :doc_lengths[i], :].reshape((-1, data.shape[2])))
-                test_token_indices.extend([(author_ind, i, j) for j in range(doc_lengths[i])])
-                test_labels.extend([author_ind] * doc_lengths[i])
-            
-
+        logger.info(f"Author {author}: {n_docs} docs, {n_docs_train} for training")
         
-    train_activations = np.array(train_activations)
-    test_activations = np.array(test_activations)
-    train_token_indices = np.array(train_token_indices)
-    test_token_indices = np.array(test_token_indices)
+        # Process each document
+        for doc_idx in range(n_docs):
+            doc_length = doc_lengths[doc_idx]
+            
+            if from_token >= doc_length:
+                continue
+                
+            # Get valid tokens for this document (excluding padding)
+            if sp.issparse(data):
+                # For sparse data, extract document tokens
+                start_idx = doc_idx * metadata.original_shape[1]
+                end_idx = start_idx + metadata.original_shape[1]
+                doc_data = data[start_idx:end_idx]
+                
+                # Filter to valid tokens only
+                doc_valid_mask = metadata.valid_mask[start_idx:end_idx]
+                valid_token_indices = np.where(doc_valid_mask)[0]
+                
+                # Apply from_token filter
+                valid_token_indices = valid_token_indices[valid_token_indices >= from_token]
+                
+                if len(valid_token_indices) == 0:
+                    continue
+                    
+                # Extract valid tokens
+                doc_tokens = doc_data[valid_token_indices]
+                
+            else:
+                # For dense data
+                doc_tokens = data[doc_idx, from_token:doc_length, :]
+                valid_token_indices = np.arange(from_token, doc_length)
+            
+            n_valid_tokens = len(valid_token_indices)
+            
+            if doc_idx < n_docs_train:
+                # Training data
+                train_activations_list.append(doc_tokens)
+                train_labels.extend([author_ind] * n_valid_tokens)
+                
+                # Update metadata
+                train_metadata['doc_ids'].extend([doc_idx] * n_valid_tokens)
+                train_metadata['tok_ids'].extend(valid_token_indices.tolist())
+                train_metadata['valid_mask'].extend([True] * n_valid_tokens)
+                train_metadata['author_ids'].extend([author_ind] * n_valid_tokens)
+            else:
+                # Test data
+                test_activations_list.append(doc_tokens)
+                test_labels.extend([author_ind] * n_valid_tokens)
+                
+                # Update metadata
+                test_metadata['doc_ids'].extend([doc_idx] * n_valid_tokens)
+                test_metadata['tok_ids'].extend(valid_token_indices.tolist())
+                test_metadata['valid_mask'].extend([True] * n_valid_tokens)
+                test_metadata['author_ids'].extend([author_ind] * n_valid_tokens)
+
+    # Combine all activations into sparse matrices
+    if train_activations_list:
+        if sp.issparse(train_activations_list[0]):
+            train_activations = sp.vstack(train_activations_list)
+        else:
+            train_activations = sp.csr_matrix(np.vstack(train_activations_list))
+    else:
+        train_activations = sp.csr_matrix((0, n_features))
+        
+    if test_activations_list:
+        if sp.issparse(test_activations_list[0]):
+            test_activations = sp.vstack(test_activations_list)
+        else:
+            test_activations = sp.csr_matrix(np.vstack(test_activations_list))
+    else:
+        test_activations = sp.csr_matrix((0, n_features))
+
+    # Convert lists to arrays
     train_labels = np.array(train_labels)
     test_labels = np.array(test_labels)
+    
+    # Convert metadata lists to arrays
+    for key in train_metadata:
+        train_metadata[key] = np.array(train_metadata[key])
+    for key in test_metadata:
+        test_metadata[key] = np.array(test_metadata[key])
 
-    logger.info(f"Shape of train data filtered and reshaped: {train_activations.shape}")
-    logger.info(f"Shape of test data filtered and reshaped: {test_activations.shape}")
+    logger.info(f"Shape of train data (sparse): {train_activations.shape}")
+    logger.info(f"Shape of test data (sparse): {test_activations.shape}")
+    logger.info(f"Train data sparsity: {1 - train_activations.nnz / (train_activations.shape[0] * train_activations.shape[1]):.4f}")
+    logger.info(f"Test data sparsity: {1 - test_activations.nnz / (test_activations.shape[0] * test_activations.shape[1]):.4f}")
     
     if binary:
-        train_activations = (train_activations > 1).astype(np.int8)
-        test_activations = (test_activations > 1).astype(np.int8)
+        # Apply binary threshold to sparse matrices
+        train_activations.data = (train_activations.data > 1).astype(np.int8)
+        test_activations.data = (test_activations.data > 1).astype(np.int8)
+        train_activations.eliminate_zeros()  # Remove zeros created by thresholding
+        test_activations.eliminate_zeros()
     
-    return train_activations, test_activations, train_token_indices, test_token_indices, train_labels, test_labels, int_to_author
+    return train_activations, test_activations, train_labels, test_labels, int_to_author, train_metadata, test_metadata
 
-
-def get_author_data_numerical_and_labels(author_data):
-    """Get author data numerical and labels, ready to use for classification with scikit-learn"""
-    author_data_numerical_dense = None
-    all_non_zero_feature_names = []
-    labels = []
-    for author, data in author_data.items():
-        logger.debug(f"Author {author} data shape: {data.shape}")
-        non_zero_feature_names = get_non_zero_feature_names(data)
-        logger.debug(f"Extending all non zero feature names with {len(non_zero_feature_names)} non zero feature names")
-        all_non_zero_feature_names.extend(non_zero_feature_names)
-    all_non_zero_feature_names = sorted(list(set(all_non_zero_feature_names)))
-    logger.debug(f"First 10 all non zero feature names: {all_non_zero_feature_names[:10]}")
-    active_feature_indices = [int(feature_name.replace("x", "")) for feature_name in all_non_zero_feature_names]
-    logger.debug(f"First 10 active feature indices: {active_feature_indices[:10]}")
-
-    for author, data in author_data.items():
-        logger.debug(f"Shape of initial reshaped data: {data.shape}")
-        data = data[:, active_feature_indices]
-        logger.debug(f"Shape of reshaped data after features filtering: {data.shape}")
-        activated_documents_indices = np.argwhere(data.sum(axis=1) > 0)[:, 0] # here anyway zero activation tokens get discarded
-        logger.info(f"Activated documents for author {author}: {len(activated_documents_indices)} out of {data.shape[0]}")
-        data_filtered = data[activated_documents_indices]
-        if author_data_numerical_dense is None:
-            author_data_numerical_dense = data_filtered.copy()
-        else:
-            author_data_numerical_dense = np.concatenate([author_data_numerical_dense, data_filtered.copy()])
-        
-
-        logger.info(f"Size of ready data for author {author}: {data_filtered.nbytes / (1024 ** 2):.2f} MB")
-        labels.extend([author] * data_filtered.shape[0])
-
-    logger.info(f"Starting to encode labels")
-    binarizer = LabelBinarizer()
-    labels_encoded  = binarizer.fit_transform(labels)
-    logger.debug(f"Labels encoded shape: {labels_encoded.shape}")
-    logger.debug(f"First 10 labels encoded: {labels_encoded[:10]}")
     
-
-    authors_classes = binarizer.classes_
-    logger.info(f"Authors classes: {authors_classes}")
-    logger.info(f"Samples per author: {labels_encoded.sum(axis=0)}")
-
-    all_non_zero_feature_names_map = {i: name for i, name in enumerate(all_non_zero_feature_names)}
-
-    return author_data_numerical_dense, labels_encoded, authors_classes, all_non_zero_feature_names_map
-
-def get_non_zero_feature_names(author_data_numerical: np.ndarray) -> list:
-    """Get non zero feature names
-    
-    Args:
-        author_data_numerical: np.ndarray, shape (n_docs x seq_len, n_features)
-    
-    Returns:
-        list
-    """
-    feature_names = [f"x{i}" for i in range(author_data_numerical.shape[1])]
-    summed_up_activations = author_data_numerical.sum(axis=0)
-    non_zero_activation_indices = np.argwhere(summed_up_activations > 0)[:, 0]
-    logger.debug(f"First 10 non zero activation indices: {non_zero_activation_indices[:10]}")
-    non_zero_feature_names = [feature_names[i] for i in range(len(feature_names)) if i in non_zero_activation_indices]
-    logger.debug(f"First 10 non zero feature names: {non_zero_feature_names[:10]}")
-
-    return non_zero_feature_names
-    
-def visualize_results_with_heatmap(predicted_labels, true_labels, tokens_inds, title, save_path):
+def visualize_results_with_heatmap(predicted_labels, true_labels, metadata, title, save_path):
     """Visualize results with heatmap"""
     
     # construct back to matrix doc x tok
-    max_docs = max(doc_ind for _, doc_ind, _ in tokens_inds)
-    max_toks = max(tok_ind for _, _, tok_ind in tokens_inds)
-    predictions = np.zeros((max_docs, max_toks))
+    max_docs = max(doc_ind for doc_ind in metadata['doc_ids'])+1
+    max_toks = max(tok_ind for tok_ind in metadata['tok_ids'])+1
+    predictions = np.full((max_docs, max_toks), np.nan)
 
-    for i, (auth_ind, doc_ind, tok_ind) in enumerate(tokens_inds):
+    for i, (doc_ind, tok_ind) in enumerate(zip(metadata['doc_ids'], metadata['tok_ids'])):
         predictions[doc_ind, tok_ind] = predicted_labels[i] == true_labels[i]
 
-    # set the rest to nan
-    predictions[predictions == 0] = np.nan
-
-    # trnsfrom boolean to int binary
-
+    # transform boolean to int binary
     predictions = predictions.astype(int)
 
     sns.heatmap(predictions, cmap=["red", "green"], 
@@ -336,30 +455,6 @@ def visualize_results_with_heatmap(predicted_labels, true_labels, tokens_inds, t
     plt.savefig(save_path)
     plt.close()
 
-def run_classification_on_all_authors(author_data_numerical, labels_encoded, authors_classes, layer_type, layer_ind, classification_results):
-    """Run classification on all authors"""
-    
-    cv = ShuffleSplit(n_splits=5, test_size=0.2, random_state=0)
-    scoring = ['accuracy', 'precision_macro', 'recall_macro', 'f1_macro']
-    
-    for author_ind, author in enumerate(authors_classes):
-        logger.info(f"Applying classification for {author}")
-        if len(authors_classes) > 2:
-            labels_encoded_one_vs_all = labels_encoded[:, author_ind]
-        else:
-            labels_encoded_one_vs_all = labels_encoded if author_ind == 0 else (labels_encoded-1)*-1
-        
-        logger.debug(f"Labels encoded one vs all shape: {labels_encoded_one_vs_all.shape}")
-        logger.debug(f"First 10 labels encoded one vs all: {labels_encoded_one_vs_all[:10]}")
-        logger.debug(f"Labels encoded one vs all sum: {labels_encoded_one_vs_all.sum()}")
-     
-        # Apply LogisticRegression
-        logistic_regression = LogisticRegression()
-        logger.info(f"Fitting LogisticRegression")
-        cv_classification_logreg_score = cross_validate(logistic_regression, author_data_numerical, labels_encoded_one_vs_all, cv=cv, scoring=scoring, n_jobs=-1)
-        logger.info(f"LogisticRegression classification scores: {cv_classification_logreg_score}")
-        for score in scoring:
-            classification_results[layer_type][layer_ind][author]["LogisticRegression"][score] = np.mean(cv_classification_logreg_score[f"test_{score}"])
 
 def main():
     """Main entry point for feature importance analysis"""
@@ -389,7 +484,7 @@ def main():
                     logger.info(f"Classification results already computed for {layer_type} {layer_ind}")
                     continue
 
-            train_activations, test_activations, train_token_indices, test_token_indices, train_labels, test_labels, int_to_author = retrieve_and_combine_author_data(author_filename_dict, args.path_to_data)
+            train_activations, test_activations, train_labels, test_labels, int_to_author, train_metadata, test_metadata = retrieve_and_combine_author_data(author_filename_dict, args.path_to_data, binary=True, from_token=args.from_token)
 
             most_important_features = defaultdict(lambda: defaultdict(list))
 
@@ -412,16 +507,35 @@ def main():
                 logger.debug(f"Test data labels shape: {labels_encoded_one_vs_all_test.shape}")
                 logger.debug(f"Test data labels sum: {labels_encoded_one_vs_all_test.sum()}")
 
-                features_data_initial = FeaturesData(train_data=train_activations, test_data=test_activations, train_labels=labels_encoded_one_vs_all, test_labels=labels_encoded_one_vs_all_test, train_token_indices=train_token_indices, test_token_indices=test_token_indices)
+                features_data_initial = FeaturesData(
+                    train_data=train_activations, 
+                    test_data=test_activations, 
+                    train_labels=labels_encoded_one_vs_all, 
+                    test_labels=labels_encoded_one_vs_all_test, 
+                    train_metadata=train_metadata,
+                    test_metadata=test_metadata
+                )
 
                 features_data_variance_threshold, most_important_features_variance_threshold = VarianceThresholdFeatureSelection(features_data_initial).run_feature_selection()
                 most_important_features[author]["variance_threshold"] = most_important_features_variance_threshold
+                
+                # Save updated metadata after variance threshold filtering
+                save_updated_metadata(
+                    features_data_variance_threshold.train_metadata,
+                    Path(args.path_to_outputs) / f"{args.run_name}" / f"train_metadata_variance_threshold__{layer_type}__{layer_ind}__{author}.json",
+                    f"After VarianceThreshold for {author} {layer_type} {layer_ind}"
+                )
+                save_updated_metadata(
+                    features_data_variance_threshold.test_metadata,
+                    Path(args.path_to_outputs) / f"{args.run_name}" / f"test_metadata_variance_threshold__{layer_type}__{layer_ind}__{author}.json",
+                    f"After VarianceThreshold for {author} {layer_type} {layer_ind}"
+                )
 
                 svm = SVC()
                 logger.info(f"Fitting SVM")
                 svm.fit(features_data_variance_threshold.train_data, features_data_variance_threshold.train_labels)
                 labels_predicted = svm.predict(features_data_variance_threshold.test_data)
-                visualize_results_with_heatmap(labels_predicted, features_data_variance_threshold.test_labels, features_data_variance_threshold.test_token_indices, f"SVM classification results for {author} {layer_type} {layer_ind} Variance Threshold features", Path(args.path_to_outputs) / f"{args.run_name}" / f"svm_classification_results__variance_threshold__{layer_type}__{layer_ind}__{author}___{args.include_prompted}.png")
+                visualize_results_with_heatmap(labels_predicted, features_data_variance_threshold.test_labels, features_data_variance_threshold.test_metadata, f"SVM classification results for {author} {layer_type} {layer_ind} Variance Threshold features", Path(args.path_to_outputs) / f"{args.run_name}" / f"svm_classification_results__variance_threshold__{layer_type}__{layer_ind}__{author}___{args.include_prompted}.png")
                 classification_report_svm = classification_report(features_data_variance_threshold.test_labels, labels_predicted, output_dict=True)
                 logger.info(f"SVM classification report: {classification_report_svm}")
                 classification_report_df = pd.DataFrame(classification_report_svm)
@@ -431,17 +545,38 @@ def main():
                 classification_results[layer_type][layer_ind][author]["variance_threshold"]["SVM"]["recall__class_1"] = classification_report_svm["1"]["recall"]
                 classification_results[layer_type][layer_ind][author]["variance_threshold"]["SVM"]["f1__class_1"] = classification_report_svm["1"]["f1-score"]
 
-                features_data_select_k_best, most_important_features_select_k_best = SelectKBestFeatureSelection(features_data_variance_threshold, most_important_features_variance_threshold, approach=f_classif, k=10).run_feature_selection()
+                features_data_select_k_best, most_important_features_select_k_best = SelectKBestFeatureSelection(features_data_variance_threshold, most_important_features_variance_threshold, approach=f_classif, k=100).run_feature_selection()
                 most_important_features[author]["select_k_best"] = most_important_features_select_k_best
 
-                features_data_sequential_feature_selector, most_important_features_sequential_feature_selector = SequentialFeatureSelector(features_data_variance_threshold, most_important_features_variance_threshold, approach=LogisticRegression(), k=10).run_feature_selection()
+                features_data_sequential_feature_selector, most_important_features_sequential_feature_selector = FeatureSelectionSequential(features_data_select_k_best, most_important_features_select_k_best, approach=LogisticRegression(), k=10).run_feature_selection()
                 most_important_features[author]["sequential_feature_selector"] = most_important_features_sequential_feature_selector
 
-                # Apply LogisticRegression
-                logistic_regression = LogisticRegression()
-                logger.info(f"Fitting LogisticRegression")
+                # Save metadata after sequential feature selection
+                save_updated_metadata(
+                    features_data_sequential_feature_selector.train_metadata,
+                    Path(args.path_to_outputs) / f"{args.run_name}" / f"train_metadata_sequential__{layer_type}__{layer_ind}__{author}.json",
+                    f"After SequentialFeatureSelector for {author} {layer_type} {layer_ind}"
+                )
+                save_updated_metadata(
+                    features_data_sequential_feature_selector.test_metadata,
+                    Path(args.path_to_outputs) / f"{args.run_name}" / f"test_metadata_sequential__{layer_type}__{layer_ind}__{author}.json",
+                    f"After SequentialFeatureSelector for {author} {layer_type} {layer_ind}"
+                )
+
+                # Apply LogisticRegression (works with sparse matrices)
+                logistic_regression = LogisticRegression(max_iter=1000)  # Increased max_iter for sparse data
+                logger.info(f"Fitting LogisticRegression on sparse data")
                 logistic_regression.fit(features_data_sequential_feature_selector.train_data, features_data_sequential_feature_selector.train_labels)
                 labels_predicted = logistic_regression.predict(features_data_sequential_feature_selector.test_data)
+                
+                """visualize_results_with_heatmap(
+                    labels_predicted, 
+                    features_data_sequential_feature_selector.test_labels, 
+                    features_data_sequential_feature_selector.test_token_indices, 
+                    f"LogisticRegression classification results for {author} {layer_type} {layer_ind} SequentialFeatureSelector features", 
+                    Path(args.path_to_outputs) / f"{args.run_name}" / f"logreg_classification_results__seq_selector__{layer_type}__{layer_ind}__{author}___{args.include_prompted}.png"
+                )"""
+                
                 classification_report_logreg = classification_report(features_data_sequential_feature_selector.test_labels, labels_predicted, output_dict=True)
                 logger.info(f"LogisticRegression classification report: {classification_report_logreg}")
                 classification_report_df = pd.DataFrame(classification_report_logreg)
@@ -451,11 +586,21 @@ def main():
                 classification_results[layer_type][layer_ind][author]["sequential_feature_selector"]["LogisticRegression"]["recall__class_1"] = classification_report_logreg["1"]["recall"]
                 classification_results[layer_type][layer_ind][author]["sequential_feature_selector"]["LogisticRegression"]["f1__class_1"] = classification_report_logreg["1"]["f1-score"]
                 
-                svm = SVC()
-                logger.info(f"Fitting SVM")
+                # Apply SVM (works with sparse matrices)
+                svm = SVC(kernel='linear')  # Linear kernel works better with sparse high-dimensional data
+                logger.info(f"Fitting SVM on sparse data")
                 svm.fit(features_data_sequential_feature_selector.train_data, features_data_sequential_feature_selector.train_labels)
-                labels_predicted = svm.predict(features_data_sequential_feature_selector.test_data)
-                classification_report_svm = classification_report(features_data_sequential_feature_selector.test_labels, labels_predicted, output_dict=True)
+                labels_predicted_svm = svm.predict(features_data_sequential_feature_selector.test_data)
+                
+                """visualize_results_with_heatmap(
+                    labels_predicted_svm, 
+                    features_data_sequential_feature_selector.test_labels, 
+                    features_data_sequential_feature_selector.test_token_indices, 
+                    f"SVM classification results for {author} {layer_type} {layer_ind} SequentialFeatureSelector features", 
+                    Path(args.path_to_outputs) / f"{args.run_name}" / f"svm_classification_results__seq_selector__{layer_type}__{layer_ind}__{author}___{args.include_prompted}.png"
+                )"""
+                
+                classification_report_svm = classification_report(features_data_sequential_feature_selector.test_labels, labels_predicted_svm, output_dict=True)
                 logger.info(f"SVM classification report: {classification_report_svm}")
                 classification_report_df = pd.DataFrame(classification_report_svm)
                 classification_report_df.to_csv(Path(args.path_to_outputs) / f"{args.run_name}" / f"classification_report__svm__{layer_type}__{layer_ind}__{author}__sequential_feature_selector.csv")

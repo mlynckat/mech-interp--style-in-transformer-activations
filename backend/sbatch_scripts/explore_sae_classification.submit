@@ -3,9 +3,9 @@
 #SBATCH --job-name=sae_classification
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:1
+#SBATCH --mem=250G
 #SBATCH --account=cai_nlp
-#SBATCH --partition=gpu_ia
+#SBATCH --partition=cpu
 #SBATCH --output=/cluster/home/mlynckat/log/%j_%N_ex06_venv.out
 #SBATCH --error=/cluster/home/mlynckat/log/%j_%N_ex06_venv.err
 

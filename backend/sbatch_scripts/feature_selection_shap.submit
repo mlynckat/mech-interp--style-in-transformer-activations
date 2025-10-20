@@ -1,13 +1,11 @@
 #!/bin/bash
 #SBATCH --time=600
-#SBATCH --job-name=get_sae_features
-#SBATCH --ntasks=4
+#SBATCH --job-name=sae_classification
+#SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:3
-#SBATCH --mem=200G
+#SBATCH --mem=250G
 #SBATCH --account=cai_nlp
-#SBATCH --partition=gpu_top
-#SBATCH --nodelist=trinity
+#SBATCH --partition=cpu
 #SBATCH --output=/cluster/home/mlynckat/log/%j_%N_ex06_venv.out
 #SBATCH --error=/cluster/home/mlynckat/log/%j_%N_ex06_venv.err
 
@@ -70,9 +68,8 @@ for package in "${!packages[@]}"; do
     fi
 done
 
-# Set CUDA debugging environment variables
-#export CUDA_LAUNCH_BLOCKING=1
-#export TORCH_USE_CUDA_DSA=1
-
 # run the workload
-python3 -m backend.src.get_features.get_classic_activations --layers 0 5 10 15 20 25 30 35 40 41 
+python3 -m backend.src.analysis.feature_selection_shap_on_aggregated
+
+# submit the job:
+# sbatch <path-to-submit-file>/venv_script.submit

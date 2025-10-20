@@ -5,47 +5,89 @@ This module contains common classes and methods used across multiple SAE analysi
 to avoid code duplication and ensure consistency.
 """
 
-import argparse
-import gc
 import os
-from collections import defaultdict, Counter
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import warnings
 import json
 import logging
+import pickle
 
 # Set up logging
 logger = logging.getLogger(__name__)
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import seaborn as sns
+import scipy.sparse as sp
 import torch
-from scipy import stats
-from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score, pairwise_distances
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from torchmetrics.clustering import DunnIndex
-from tqdm.auto import tqdm
-from transformer_lens import HookedTransformer
-import altair as alt
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-import multiprocessing as mp
-import datasets
-from typing import Set
 
 from abc import abstractmethod
+from enum import Enum
 
+class StorageFormat(Enum):
+    """Enumeration for storage format options."""
+    DENSE = "dense"
+    SPARSE = "sparse"
 
 @dataclass
-class SAEMetadata:
-    """Data class for SAE metadata"""
-    author: str
-    layer: int
-    sae_name: str
-    tokens_per_doc: np.ndarray
+class ActivationMetadata:
+    """
+    Metadata for activation storage with full traceability.
+    
+    Attributes:
+        doc_ids: Array mapping each position to document index
+        tok_ids: Array mapping each position to token index within document
+        author_id: Author identifier
+        doc_lengths: Actual length of each document (excluding padding)
+        valid_mask: Boolean mask indicating valid (non-padding) positions
+        original_shape: Original 3D shape (n_docs, max_seq_len, n_features)
+        n_features: Number of SAE features
+        storage_format: 'dense' or 'sparse'
+        layer_type: Type of layer (res, mlp, att)
+        layer_index: Layer number
+        sae_id: SAE identifier
+        model_name: Model name
+    """
+    doc_ids: np.ndarray
+    tok_ids: np.ndarray
+    author_id: str
+    doc_lengths: np.ndarray
+    valid_mask: np.ndarray
+    original_shape: Tuple[int, int, int]
+    n_features: int
+    storage_format: str
+    layer_type: str
+    layer_index: int
+    sae_id: str
+    model_name: str
+    
+    def save(self, filepath: Path):
+        """Save metadata to pickle file."""
+        with open(filepath, 'wb') as f:
+            pickle.dump(self, f)
+    
+    @staticmethod
+    def load(filepath: Path):
+        """Load metadata from pickle file."""
+        with open(filepath, 'rb') as f:
+            return pickle.load(f)
+    
+    def get_position(self, doc_idx: int, tok_idx: int) -> Optional[int]:
+        """
+        Get the position in flattened array for a given doc_idx and tok_idx.
+        Returns None if position is padding.
+        """
+        max_seq_len = self.original_shape[1]
+        flat_pos = doc_idx * max_seq_len + tok_idx
+        
+        if flat_pos >= len(self.valid_mask):
+            return None
+        
+        return flat_pos if self.valid_mask[flat_pos] else None
 
 
 @dataclass
@@ -335,11 +377,14 @@ class ActivationFilenamesLoader(FilenamesLoader):
         Expected format: sae_{prompted}__{model}__{activation_type}__activations__{author}__layer_{layeri}.npz
         Example: sae_prompted__google_gemma-2-2b__res__activations__author1__layer_5.npz
         """
-        if not filename.endswith(".npz"):
-            raise ValueError(f"Expected .npz file, got: {filename}")
+        if not (filename.endswith(".npz") or filename.endswith(".sparse.npz")):
+            raise ValueError(f"Expected .npz or .sparse.npz file, got: {filename}")
 
-        # Remove .npz extension
-        name_without_ext = filename[:-4]
+        # Remove extension (.npz or .sparse.npz)
+        if filename.endswith(".sparse.npz"):
+            name_without_ext = filename[:-11]  # Remove .sparse.npz
+        else:
+            name_without_ext = filename[:-4]   # Remove .npz
         
         # Split by double underscores to get main components
         parts = name_without_ext.split("__")
@@ -374,7 +419,7 @@ class ActivationFilenamesLoader(FilenamesLoader):
         Returns:
             Filtered list of filenames
         """
-        filenames = [f for f in os.listdir(self.data_dir) if f.endswith(".npz")]
+        filenames = [f for f in os.listdir(self.data_dir) if f.endswith(".npz") or f.endswith(".sparse.npz")]
         filtered_filenames = []
         
         for filename in filenames:
@@ -395,6 +440,7 @@ class ActivationFilenamesLoader(FilenamesLoader):
 
                 if self.include_prompted and self.include_prompted != parsed['prompted']:
                     continue
+                
                 
                 filtered_filenames.append(filename)
                 
@@ -424,8 +470,13 @@ class ActivationFilenamesLoader(FilenamesLoader):
                 activation_type = filename_parsed["activation_type"]
                 layer_ind = filename_parsed["layer_ind"]
                 author = filename_parsed["author"]
+
+                if filename.endswith(".sparse.npz"):
+                    name_without_ext = filename[:-11]  # Remove .sparse.npz
+                else:
+                    name_without_ext = filename[:-4]   # Remove .npz
                 
-                filenames_structured[activation_type][layer_ind][author] = filename
+                filenames_structured[activation_type][layer_ind][author] = name_without_ext
             except (ValueError, KeyError) as e:
                 logger.warning(f"Could not parse filename '{filename}': {e}")
                 continue
@@ -466,8 +517,8 @@ class EntropyFilenamesLoader(FilenamesLoader):
         """
         Parse structured filename into components.
         
-        Expected format: sae_<prompted>__{model}__entropy_loss__{author}.npy or sae_<prompted>__{model}__cross_entropy_loss__{author}.npy
-        Example: sae_prompted__google_gemma-2-2b__entropy_loss__{author}.npy or sae_prompted__google_gemma-2-2b__cross_entropy_loss__{author}.npy
+        Expected format: sae_{setting}__{model}__entropy__{author}.npy or sae_{setting}__{model}__cross_entropy_loss__{author}.npy
+        Example: sae_baseline__google_gemma-2-9b__entropy__bush.npy or sae_baseline__google_gemma-2-9b__cross_entropy_loss__bush.npy
         """
         if not filename.endswith(".npy") or "entropy" not in filename:
             raise ValueError(f"Expected .npy file and entropy in name, got: {filename}")
@@ -478,14 +529,22 @@ class EntropyFilenamesLoader(FilenamesLoader):
         # Split by double underscores to get main components
         parts = name_without_ext.split("__")
         
-        if len(parts) < 4:  # 4 parts for sae_<prompted>__{model}__entropy_loss__{author}.npy
+        if len(parts) < 4:  # 4 parts for sae_{setting}__{model}__entropy__{author}.npy
             raise ValueError(f"Invalid filename format. Expected at least 4 parts separated by '__', got {len(parts)}: {filename}")
         
         # Extract components
         prompted = "prompted" if "prompted" in parts[0] else "baseline"
-        model = parts[1]  # google_gemma-2-2b
-        entropy_type = parts[2]  # entropy or cross_entropy
-        author = parts[3]  # author name
+        model = parts[1]  # google_gemma-2-9b
+        
+        # Handle both entropy types
+        if "cross_entropy_loss" in filename:
+            entropy_type = "cross_entropy_loss"
+        elif "entropy" in filename:
+            entropy_type = "entropy"
+        else:
+            entropy_type = parts[2]  # fallback
+            
+        author = parts[-1]  # author name (last part)
 
         
         return {
@@ -578,8 +637,8 @@ class TokenandFullTextFilenamesLoader(FilenamesLoader):
         """
         Parse filename into components.
 
-        Expected format: sae__{model}__tokens__{author}.json or sae__{model}__full_texts__{author}.json
-        Example: sae__google_gemma-2-2b__tokens__{author}.json or sae__google_gemma-2-2b__full_texts__{author}.json
+        Expected format: sae_{setting}__{model}__tokens__{author}.json or sae_{setting}__{model}__full_texts__{author}.json
+        Example: sae_baseline__google_gemma-2-9b__tokens__bush.json or sae_baseline__google_gemma-2-9b__full_texts__bush.json
         """
         if not filename.endswith(".json") or all(info_type not in filename for info_type in ["tokens", "full_texts"]):
             raise ValueError(f"Expected .json file and tokens or full_texts in name, got: {filename}")
@@ -590,85 +649,52 @@ class TokenandFullTextFilenamesLoader(FilenamesLoader):
         # Split by double underscores to get main components
         parts = name_without_ext.split("__")
         
-        if len(parts) < 4:  # 4 parts for sae__{model}__tokens__{author}.json
+        if len(parts) < 4:  # 4 parts for sae_{setting}__{model}__tokens__{author}.json
             raise ValueError(f"Invalid filename format. Expected at least 4 parts separated by '__', got {len(parts)}: {filename}")
         
         # Extract components
-        model = parts[1]  # google_gemma-2-2b
+        prompted = "prompted" if "prompted" in parts[0] else "baseline"
+        model = parts[1]  # google_gemma-2-9b
         information_type = parts[2]  # tokens or full_texts
         author = parts[3]  # author name
-        prompted = parts[0].split("_")[1]  # prompted
 
         return {"model": model, "information_type": information_type, "author": author, "prompted": prompted}
 
 
 class DataLoader:
     """Handles loading and validation of SAE data files"""
-
-    @staticmethod
-    def load_npz_file(filepath: Path) -> Dict[str, Any]:
-        """Load and validate .npz file"""
-        logger.info(f"Loading file: {filepath}")
-        if not filepath.exists():
-            raise FileNotFoundError(f"File not found: {filepath}")
-
-        # Use memory mapping for large files to reduce memory usage
-        if filepath.stat().st_size > 100 * 1024 * 1024:  # 100MB threshold
-            return np.load(filepath, allow_pickle=True, mmap_mode='r')
-        else:
-            return np.load(filepath, allow_pickle=True)
-
-    @staticmethod
-    def extract_metadata(data: Dict[str, Any]) -> SAEMetadata:
-        """Extract and validate metadata from loaded data"""
-        if 'metadata' not in data:
-            raise ValueError("Metadata not found in the .npz file.")
-
-        metadata = data['metadata'].item() if hasattr(data['metadata'], 'item') else data['metadata']
-
-        return SAEMetadata(
-            author=metadata['author'],
-            layer=metadata['layer'],
-            sae_name=metadata['sae_name'],
-            tokens_per_doc=metadata['tokens_per_doc']
-        )
+        
 
     @staticmethod
     def validate_activations(activations: np.ndarray) -> bool:
         """Check if activations data is valid (no empty rows)"""
         return np.all(np.any(np.any(activations, axis=2), axis=1))
 
-    def load_sae_activations(self, filepath: Path) -> Tuple[SAEMetadata, np.ndarray]:
-        """Main method to load SAE activations with full validation"""
+    def load_sae_activations(self, filepath: Path) -> Tuple[np.ndarray, ActivationMetadata]:
+        """
+        Load activations from either dense or sparse format.
         
-        data = self.load_npz_file(filepath)
-        metadata = self.extract_metadata(data)
-
-        if 'activations' not in data:
-            raise ValueError("Activations not found in the .npz file.")
-
-        activations = data['activations']
-        logger.info(f"Loaded activations with shape: {activations.shape}")
-
-        if not self.validate_activations(activations):
-            warnings.warn("Looks like the activations are missing for some of the samples")
-
-        logger.info(f"Loaded activations for Layer {metadata.layer} {metadata.sae_name} for {metadata.author}...")
-
-        return metadata, activations
-
-    def load_sae_activations_simple(self, filepath: Path) -> np.ndarray:
-        """Load SAE activations without metadata (for feature importance analysis)"""
+        Returns:
+            activations: 3D numpy array (n_docs, max_seq_len, n_features)
+            metadata: ActivationMetadata object
+        """
+        meta_path = Path(filepath).with_suffix('.meta.pkl')
+        metadata = ActivationMetadata.load(meta_path)
         
-        data = self.load_npz_file(filepath)
-
-        if 'activations' not in data:
-            raise ValueError("Activations not found in the .npz file.")
-
-        activations = data['activations']
-        logger.info(f"Loaded activations with shape: {activations.shape}")
+        if metadata.storage_format == 'dense':
+            data_path = Path(filepath).with_suffix('.npz')
+            data = np.load(data_path)
+            activations = data['activations']
+        else:  # sparse
+            data_path = Path(filepath).with_suffix('.sparse.npz')
+            sparse_matrix = sp.load_npz(data_path)
+            activations = sparse_matrix
+            
+            # Convert back to 3D dense array
+            """flat_acts = sparse_matrix.toarray()
+            activations = flat_acts.reshape(metadata.original_shape)"""
         
-        return activations
+        return activations, metadata
 
 
 class ActivationProcessor:
@@ -828,7 +854,7 @@ class BaseAnalyzer:
         self.activation_processor = ActivationProcessor()
         self.metrics_calculator = MetricsCalculator()
         self.token_loader = TokenLoader()
-        self.filename_parser = FilenameParser()
+        self.filename_parser = ActivationFilenamesLoader(self.data_dir)
         
         # Discover authors and set up color mapping
         self._load_or_discover_authors()

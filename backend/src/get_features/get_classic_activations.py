@@ -1,5 +1,5 @@
 """ 
-Counts the number of times each SAE feature fires across some corpus.
+Counts the number of times each feature fires across some corpus.
 """
 import os
 import argparse
@@ -14,7 +14,6 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 import numpy as np
-import scipy.sparse as sp
 
 from dotenv import load_dotenv
 import torch
@@ -23,11 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from huggingface_hub import login
-from sae_lens import SAE, HookedSAETransformer
+from transformer_lens import HookedTransformer
+import transformer_lens.utils as utils
 
 from backend.src.utils.load_dataset import load_news_data, load_AuthorMix_data
-from backend.src.utils.run_configuration import ModelConfig, SAELayerConfig, DatasetConfig
-from backend.src.utils.shared_utilities import ActivationMetadata, StorageFormat
+from backend.src.utils.run_configuration import ModelConfig, DatasetConfig
+from backend.src.utils.shared_utilities import ActivationMetadata
+
+
 
 # Set up logging
 logging.basicConfig(
@@ -49,24 +51,18 @@ class ActivationStorage:
     
     def __init__(
         self, 
-        storage_format: StorageFormat,
+        model: HookedTransformer,
         n_docs: int,
         max_seq_len: int,
-        n_features: int
     ):
-        self.storage_format = storage_format
+        self.model = model
         self.n_docs = n_docs
         self.max_seq_len = max_seq_len
-        self.n_features = n_features
-        
-        # Initialize storage based on format
-        if storage_format == StorageFormat.DENSE:
-            self.activations = np.zeros((n_docs, max_seq_len, n_features), dtype=np.float32)
-            self.padding_mask = np.zeros((n_docs, max_seq_len), dtype=bool)
-        else:
-            # For sparse, accumulate as list of (doc_idx, tok_idx, feature_idx, value) tuples
-            self.sparse_entries = []
-            self.padding_mask = np.zeros((n_docs, max_seq_len), dtype=bool)
+        self.n_features = model.cfg.d_model
+
+        # Initialize storage
+        self.activations = np.zeros((n_docs, max_seq_len, self.n_features), dtype=np.float32)
+        self.padding_mask = np.zeros((n_docs, max_seq_len), dtype=bool)
     
     def add_batch(
         self, 
@@ -90,17 +86,10 @@ class ActivationStorage:
             # Update padding mask
             self.padding_mask[doc_idx, :seq_len] = True
             
-            if self.storage_format == StorageFormat.DENSE:
-                # Dense storage: directly assign
-                self.activations[doc_idx, :seq_len, :] = batch_acts_np[local_idx, :seq_len, :]
-            else:
-                # Sparse storage: only store non-zero values
-                acts = batch_acts_np[local_idx, :seq_len, :]
-                non_zero_indices = np.nonzero(acts)
-                
-                for tok_offset, feat_idx in zip(non_zero_indices[0], non_zero_indices[1]):
-                    value = acts[tok_offset, feat_idx]
-                    self.sparse_entries.append((doc_idx, tok_offset, feat_idx, value))
+            
+            # Dense storage: directly assign
+            self.activations[doc_idx, :seq_len, :] = batch_acts_np[local_idx, :seq_len, :]
+            
     
     def save(
         self,
@@ -109,7 +98,6 @@ class ActivationStorage:
         doc_lengths: np.ndarray,
         layer_type: str,
         layer_index: int,
-        sae_id: str,
         model_name: str
     ):
         """
@@ -121,7 +109,6 @@ class ActivationStorage:
             doc_lengths: Actual length of each document
             layer_type: Type of layer (res, mlp, att)
             layer_index: Layer number
-            sae_id: SAE identifier,
             model_name: Model name
             
         Returns:
@@ -142,20 +129,17 @@ class ActivationStorage:
             author_id=author_id,
             doc_lengths=doc_lengths,
             valid_mask=valid_mask,
+            storage_format="dense",
+            sae_id=None,
             original_shape=(n_docs, max_seq, self.n_features),
             n_features=self.n_features,
-            storage_format=self.storage_format.value,
             layer_type=layer_type,
             layer_index=layer_index,
-            sae_id=sae_id,
             model_name=model_name
         )
         
-        # Save based on final format
-        if self.storage_format == StorageFormat.DENSE:
-            data_path, meta_path = self._save_dense(filepath, metadata)
-        else:
-            data_path, meta_path = self._save_sparse(filepath, metadata)
+        # Save 
+        data_path, meta_path = self._save_dense(filepath, metadata)
         
         save_time = time.time() - start_time
         
@@ -172,7 +156,7 @@ class ActivationStorage:
                 size_bytes /= 1024.0
             return f"{size_bytes:.2f} TB"
         
-        logger.info(f"Saved {self.storage_format.value} activations to {filepath} in {save_time:.2f}s")
+        logger.info(f"Saved dense activations to {filepath} in {save_time:.2f}s")
         logger.info(f"  File sizes: data={format_size(data_size)}, metadata={format_size(meta_size)}, total={format_size(total_size)}")
         logger.info(f"  Valid tokens: {np.sum(valid_mask)}, Padding: {np.sum(~valid_mask)}")
         
@@ -187,50 +171,16 @@ class ActivationStorage:
         data_path = Path(filepath).with_suffix('.npz')
         meta_path = Path(filepath).with_suffix('.meta.pkl')
         
-        """np.savez_compressed(
+        np.savez_compressed(
             data_path,
             activations=self.activations,
             padding_mask=self.padding_mask
-        )"""
-        np.savez(data_path, self.activations)
+        )
+        #np.savez(data_path, self.activations)
         metadata.save(meta_path)
         
         return data_path, meta_path
     
-    def _save_sparse(self, filepath: Path, metadata: ActivationMetadata):
-        """Save in sparse format.
-        
-        Returns:
-            tuple: (data_path, meta_path) - Paths to the saved files
-        """
-        data_path = Path(filepath).with_suffix('.sparse.npz')
-        meta_path = Path(filepath).with_suffix('.meta.pkl')
-        
-        if self.storage_format == StorageFormat.DENSE:
-            # Convert dense to sparse
-            flat_acts = self.activations.reshape(-1, self.n_features)
-            sparse_matrix = sp.csr_matrix(flat_acts)
-        else:
-            # Build sparse matrix from entries
-            n_positions = self.n_docs * self.max_seq_len
-            
-            if len(self.sparse_entries) == 0:
-                # Handle empty case
-                sparse_matrix = sp.csr_matrix((n_positions, self.n_features), dtype=np.float32)
-            else:
-                doc_indices, tok_indices, feat_indices, values = zip(*self.sparse_entries)
-                row_indices = np.array(doc_indices) * self.max_seq_len + np.array(tok_indices)
-                
-                sparse_matrix = sp.csr_matrix(
-                    (values, (row_indices, feat_indices)),
-                    shape=(n_positions, self.n_features),
-                    dtype=np.float32
-                )
-        
-        sp.save_npz(data_path, sparse_matrix)
-        metadata.save(meta_path)
-        
-        return data_path, meta_path
 
 
 class MyDataset(Dataset):
@@ -345,7 +295,7 @@ def load_model(model_config: ModelConfig, device):
     Load the model for the given rank (given GPU).
     """
     logger.info(f"Loading model {model_config.model_name} on {device}")
-    model = HookedSAETransformer.from_pretrained(
+    model = HookedTransformer.from_pretrained(
         model_config.model_name,
         fold_ln=True,
         center_writing_weights=False,
@@ -392,46 +342,11 @@ def log_gpu_memory_usage():
         logger.info("========================")
 
 
-def load_canonical_sae(sae_layer_config: SAELayerConfig, device: torch.device):
-    """
-    Attempts to load the canonical SAE for the given layer_type / layer / width.
-    Returns (sae, sae_id) if successful, else None.
-    """ 
-    try:
-        logger.info(f"Loading canonical SAE for layer_type={sae_layer_config.layer_type}, layer={sae_layer_config.layer_index}, width={sae_layer_config.width} from {sae_layer_config.release_name} with sae_id={sae_layer_config.sae_id}")
-        sae, cfg, sparsity = SAE.from_pretrained(
-            release=sae_layer_config.release_name,
-            sae_id=sae_layer_config.sae_id,
-        )
-        sae = sae.to(device)
-        sae.eval()
-        return sae, sae_layer_config.sae_id
-    except Exception as e:
-        logger.error(f"Could not load canonical SAE for layer_type={sae_layer_config.layer_type}, layer={sae_layer_config.layer_index}, width={sae_layer_config.width}: {e}")
-        return None
 
-def load_saes(model_config: ModelConfig, layers, width, device):
-    """
-    layer_type: 'res', 'mlp', or 'att'
-    width: e.g. 16384 (for 16k)
-    """
-    saes = {}
-    saes_ids = {}
-    for layer_type in model_config.layer_types:
-        saes[layer_type] = []
-        saes_ids[layer_type] = []
-        for layer in layers:
-            sae_layer_config = SAELayerConfig(layer_type=layer_type, layer_index=layer, width=width, model_name=model_config.model_name, canonical=True)
-            sae, sae_id = load_canonical_sae(sae_layer_config, device)
-            saes[layer_type].append(sae)
-            saes_ids[layer_type].append(sae_id)
-    
-        logger.info(f"Loaded {len(saes[layer_type])} SAEs for layer_type {layer_type}")
-    return saes, saes_ids
 
 def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, dataset_config, batch_size, save_dir):
     """
-    Run the inference for the given rank and save SAE features and cross-entropy loss and entropy.
+    Run the inference for the given rank and save activations and cross-entropy loss and entropy.
     """
 
     # Setup DDP environment
@@ -441,17 +356,11 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
     model_config = ModelConfig(model_name=parsed_args.model, layer_indices=parsed_args.layers)
     model = load_model(model_config, device)
 
-    # Determine storage format
-    storage_format = StorageFormat(parsed_args.storage_format)
 
     # Assign authors to this GPU 
     authors_for_this_gpu = author_subsets[rank]
     
     logger.info(f"GPU {rank} will process {len(authors_for_this_gpu)} authors: {authors_for_this_gpu}")
-    
-    # Load SAEs once
-    logger.info(f"GPU {rank} loading SAEs for all authors...")
-    saes, saes_ids = load_saes(model_config, parsed_args.layers, parsed_args.sae_features_width, device)
 
     # Process each author assigned to this GPU
     for author_idx, author in enumerate(authors_for_this_gpu):
@@ -460,16 +369,15 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
         
         logger.info(f"Number of documents for author {author}: {len(docs)}")
 
-        # Initialize storage for each layer and SAE
+        # Initialize storage for each layer 
         activations = {}
-        for layer_type in saes_ids:
+        for layer_type in model_config.layer_types:
             activations[layer_type] = {}
-            for sae_name, sae in zip(saes_ids[layer_type], saes[layer_type]):
-                activations[layer_type][sae_name] = ActivationStorage(
-                    storage_format=storage_format,
+            for layer_ind in model_config.layer_indices:
+                activations[layer_type][layer_ind] = ActivationStorage(
+                    model=model,
                     n_docs=dataset_config.max_n_docs_per_author,
-                    max_seq_len=dataset_config.max_sequence_length - 1,
-                    n_features=sae.cfg.d_sae
+                    max_seq_len=dataset_config.max_sequence_length - 1
                 )
         # Initialize storage for cross-entropy loss and entropy
         cross_entropy_loss_author = np.zeros((dataset_config.max_n_docs_per_author, dataset_config.max_sequence_length-1), dtype=np.float32)
@@ -513,14 +421,8 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
 
                     tokens_per_author.extend([input_tokens_doc[prompt_length_doc:] for input_tokens_doc in input_tokens_batch])
                     full_texts_per_author.extend(full_texts_batch)
-
-
-                    # Forward pass
-                    full_list_saes = []
-                    for layer_type in model_config.layer_types:
-                        full_list_saes.extend(saes[layer_type])
                     
-                    logits, cache = model.run_with_cache_with_saes(input_ids, saes=full_list_saes)
+                    logits, cache = model.run_with_cache(input_ids)
                 
 
                     # Get cross-entropy loss
@@ -546,14 +448,19 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
 
                     
                     for layer_type in model_config.layer_types:
-                        for layeri, sae_id, sae in zip(model_config.layer_indices, saes_ids[layer_type], saes[layer_type]):
+                        for layeri in model_config.layer_indices:
                             
-                            logger.debug(f"Processing {layer_type} layer_type SAE for layer {layeri} and SAE {sae_id} with shape {sae.cfg.d_sae}")
-                            hook_name = f'{sae.cfg.metadata.hook_name}.hook_sae_acts_post'
-                            sae_acts = cache[hook_name][:, prompt_length_doc:].to(device)
+                            logger.debug(f"Processing {layer_type} layer_type for layer {layeri} ")
+                            layer_type_hook = {
+                                "res": "resid_post",
+                                "mlp": "mlp_out",
+                                "att": "attn_out"
+                            }
+                            hook_name = utils.get_act_name(layer_type_hook[layer_type], layeri)
+                            dense_acts = cache[hook_name][:, prompt_length_doc:].to(device)
                             
-                            activations[layer_type][sae_id].add_batch(
-                                sae_acts,
+                            activations[layer_type][layeri].add_batch(
+                                dense_acts,
                                 batch_doc_indices,
                                 actual_lengths
                             )
@@ -583,12 +490,12 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
         logger.info("Saving entropy and cross-entropy loss...")
         np.save(
             os.path.join(save_dir, 
-                        f"sae_{parsed_args.setting}__{model_name_safe}__entropy__{author}.npy"),
+                        f"dense_{parsed_args.setting}__{model_name_safe}__entropy__{author}.npy"),
             entropy_author
         )
         np.save(
             os.path.join(save_dir,
-                        f"sae_{parsed_args.setting}__{model_name_safe}__cross_entropy_loss__{author}.npy"),
+                        f"dense_{parsed_args.setting}__{model_name_safe}__cross_entropy_loss__{author}.npy"),
             cross_entropy_loss_author
         )
 
@@ -596,12 +503,12 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
         logger.info("Saving tokens and full texts...")
 
         with open(os.path.join(save_dir,
-                              f"sae_{parsed_args.setting}__{model_name_safe}__tokens__{author}.json"),
+                              f"dense_{parsed_args.setting}__{model_name_safe}__tokens__{author}.json"),
                  "w", encoding="utf-8") as f:
             json.dump(tokens_per_author, f, ensure_ascii=False, indent=4)
         
         with open(os.path.join(save_dir,
-                              f"sae_{parsed_args.setting}__{model_name_safe}__full_texts__{author}.json"),
+                              f"dense_{parsed_args.setting}__{model_name_safe}__full_texts__{author}.json"),
                  "w", encoding="utf-8") as f:
             json.dump(full_texts_per_author, f, ensure_ascii=False, indent=4)
         
@@ -611,18 +518,17 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
         save_times = []
         file_sizes = []
         for layer_type in model_config.layer_types:
-            for layeri, sae_id in zip(model_config.layer_indices, saes_ids[layer_type]):
-                base_filename = (f"sae_{parsed_args.setting}__{model_name_safe}__{layer_type}"
+            for layeri in model_config.layer_indices:
+                base_filename = (f"dense_{parsed_args.setting}__{model_name_safe}__{layer_type}"
                                f"__activations__{author}__layer_{layeri}")
                 filepath = os.path.join(save_dir, base_filename)
                 
-                save_time, file_size = activations[layer_type][sae_id].save(
+                save_time, file_size = activations[layer_type][layeri].save(
                     filepath=Path(filepath),
                     author_id=author,
                     doc_lengths=doc_lengths,
                     layer_type=layer_type,
                     layer_index=layeri,
-                    sae_id=sae_id,
                     model_name=model_name_safe
                 )
                 save_times.append(save_time)
@@ -719,12 +625,7 @@ if __name__ == "__main__":
         choices=["google/gemma-2-2b", "google/gemma-2-9b"],
         help="Model to use for feature extraction"
     )
-    parser.add_argument(
-        "--sae_features_width",
-        type=str,
-        default="16k",
-        help="Number of SAE features (e.g., 16k, 32k, 65k, 131k)"
-    )
+    
     parser.add_argument(
         '--layers',
         nargs='+',
@@ -737,14 +638,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="AuthorMix",
+        default="news",
         choices=["AuthorMix", "news"],
         help="Dataset to use"
     )
     parser.add_argument(
         "--category_name",
         type=str,
-        default=None,
+        default="politics",
         help="Category for news dataset"
     )
     parser.add_argument(
@@ -790,22 +691,15 @@ if __name__ == "__main__":
     
     # Storage arguments
     parser.add_argument(
-        "--storage_format",
-        type=str,
-        default="dense",
-        choices=["dense", "sparse"],
-        help="Storage format: 'dense' for full arrays, 'sparse' for sparse matrices"
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
-        default="data/raw_features",
+        default="data/raw_dense_features",
         help="Directory to save results"
     )
     parser.add_argument(
         "--run_name",
         type=str,
-        default="politics_500_timing_test",
+        default="politics_500",
         help="Name of the run to create a folder in outputs"
     )
 

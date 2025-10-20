@@ -40,7 +40,13 @@ def create_heatmap(entropy: np.ndarray, tokens: List[List[str]], author: str, en
     
     plt.figure(figsize=(12, 10))
     # Plot
-    ax = sns.heatmap(entropy, cmap="RdBu" if prompted == "prompted-baseline" else "viridis", 
+    if prompted == "prompted-baseline":
+        ax = sns.heatmap(entropy, cmap="RdBu", 
+                        mask=np.isnan(entropy),  # mask so the nan cells aren’t coloured
+                        center=0,
+                        cbar=True)
+    else:
+        ax = sns.heatmap(entropy, cmap="viridis", 
                     mask=np.isnan(entropy),  # mask so the nan cells aren’t coloured
                     cbar=True)
 
@@ -58,9 +64,9 @@ def retrieve_doc_tok_positions_of_improved_entropies(entropy_diffs: np.ndarray):
 def parse_arguments():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path_to_data", type=str, default="data/raw_features/AuthorMixPolitics500", help="Path to the data")
+    parser.add_argument("--path_to_data", type=str, default="data/raw_features/AuthorMixPolitics500canonical-9b", help="Path to the data")
     parser.add_argument("--path_to_outputs", type=str, default="data/output_data", help="Path to the outputs")
-    parser.add_argument("--run_name", type=str, default="explore_entropies", help="The name of the run to create a folder in outputs")
+    parser.add_argument("--run_name", type=str, default="explore_entropies_Politics500canonical-9b", help="The name of the run to create a folder in outputs")
     parser.add_argument(
         "--include_authors",
         type=str,

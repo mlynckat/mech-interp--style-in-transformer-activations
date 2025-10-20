@@ -14,7 +14,7 @@ class ModelConfig:
     layer_types: Optional[List[str]] = None
 
     def __post_init__(self):
-        if self.model_name not in ["google/gemma-2-2b", "google/gemma-2-9b"]:
+        if self.model_name not in ["google/gemma-2-2b", "google/gemma-2-9b", "google/gemma-2-9b-it"]:
             raise ValueError(f"Model {self.model_name} is not supported.")
         max_layers = 26 if self.model_name == "google/gemma-2-2b" else 42
         if self.layer_indices is None:
@@ -27,7 +27,12 @@ class ModelConfig:
                 logger.warning(f"{len_initial - len(self.layer_indices)} layer indices are out of range for model {self.model_name}. Removing them.")
         
         if self.layer_types is None:
-            self.layer_types = ["res", "mlp", "att"] if self.model_name == "google/gemma-2-2b" else ["res"]
+            if self.model_name == "google/gemma-2-9b-it" or self.model_name == "google/gemma-2-2b"  :
+                self.layer_types = ["res", "mlp", "att"]
+            elif self.model_name == "google/gemma-2-9b":
+                self.layer_types = ["res"]
+            else:
+                raise ValueError(f"Model {self.model_name} is not supported.")
 
 
 @dataclass
@@ -35,7 +40,7 @@ class SAELayerConfig:
     model_name: str
     layer_type: str
     layer_index: int
-    width: int
+    width: str
     canonical: bool
     l0: Optional[int] = None
     release_name: str = Field(default_factory=str, init=False)
@@ -78,9 +83,11 @@ class DatasetConfig:
     author_list: Optional[List[str]] = None
 
     def __post_init__(self):
-        if self.dataset_name not in ["AuthorMix", "news"]:
+        if self.dataset_name not in ["AuthorMix", "news", "synthetic"]:
             raise ValueError(f"Dataset {self.dataset_name} is not supported.")
         if self.dataset_name == "news":
+            self.max_sequence_length = 512
+        elif self.dataset_name == "synthetic":
             self.max_sequence_length = 512
         else:
             self.max_sequence_length = 360
