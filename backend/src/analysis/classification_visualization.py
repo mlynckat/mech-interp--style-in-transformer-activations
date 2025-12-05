@@ -1,3 +1,4 @@
+import sys
 import json
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -5,6 +6,10 @@ import pandas as pd
 from collections import defaultdict
 import glob
 import logging
+from pathlib import Path
+
+import altair as alt
+
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -15,7 +20,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-path_to_outputs = "data/output_data/feature_selection_for_classification_politics500"
+path_to_outputs = "data/output_data/news/politics/google_gemma-2-9b-it/news_500_politics/feature_selection_aggregated"
 path_to_json = f"{path_to_outputs}/classification_results.json"
 
 with open(path_to_json, "r") as f:
@@ -32,19 +37,65 @@ authors = list(classification_results[layer_types[0]][layer_inds[0]].keys())
 n_authors = len(authors)
 logger.info(f"n_authors: {n_authors}, n_layer_types: {n_layer_types}")
 
-fig, ax = plt.subplots(n_authors, n_layer_types, figsize=(15, 15))
 
-reshaped_data = defaultdict(lambda: defaultdict(pd.DataFrame))
+
+dict_reshaped = {
+    "layer_type": [],
+    "layer_ind": [],
+    "author": [],
+    "data_transformation": [],
+    "classification_model": [],
+    "metric": [],
+    "value": []
+}
 
 for layer_type, layer_ind_dict in classification_results.items():
     for layer_ind, author_dict in layer_ind_dict.items():
-        for author, model_dict in author_dict.items():
-            score_dict = model_dict["LogisticRegression"]
-            scores_df = pd.DataFrame(score_dict, index=[int(layer_ind)])
-            scores_df["layer_ind"] = layer_ind
-            reshaped_data[layer_type][author] = pd.concat([reshaped_data[layer_type][author], scores_df])
+        for author, transformation_dict in author_dict.items():
+            for data_transformation, classification_model_dict in transformation_dict.items():
+                for classification_model, metric_dict in classification_model_dict.items():
+                    for metric, value in metric_dict.items():
+                        dict_reshaped["layer_type"].append(layer_type)
+                        dict_reshaped["layer_ind"].append(layer_ind)
+                        dict_reshaped["author"].append(author)
+                        dict_reshaped["data_transformation"].append(data_transformation)
+                        dict_reshaped["classification_model"].append(classification_model)
+                        dict_reshaped["metric"].append(metric)
+                        dict_reshaped["value"].append(value)
+
+df_reshaped = pd.DataFrame(dict_reshaped)
+
+assert df_reshaped["layer_type"].nunique() == 1, "At the moment only res layer type is supported"
+
+# Fill subplots with scatter plots (layer ind on X axis, values on Y axis, one plot per metric)
+authors_to_exclude = ["Sam Levine", "Igor Bobic", "Marina Fang"]
+df_reshaped_filtered = df_reshaped[~df_reshaped["author"].isin(authors_to_exclude)]
+
+for metric in df_reshaped_filtered["metric"].unique():
+
+    df_metric = df_reshaped_filtered[df_reshaped_filtered["metric"] == metric]
+    
+    # create subplots, one plot per author, no more than three plots per row
+    fig, ax = plt.subplots(n_authors // 3 + 1, 3, figsize=((n_authors // 3 + 1) * 10, 30))
 
 
+    chart = alt.Chart(df_metric).mark_line().encode(
+        x=alt.X("layer_ind", title="Layer Index"),
+        y=alt.Y("value", title=metric),
+        color=alt.Color("classification_model", legend=alt.Legend(title="Classification Model")),
+        shape=alt.Shape("data_transformation", legend=alt.Legend(title="Data Transformation")),
+        strokeDash=alt.StrokeDash("data_transformation", legend=alt.Legend(title="Data Transformation Dash")),
+        tooltip=["classification_model", "data_transformation", "value"]
+    ).properties(
+        title=f"{metric}",
+        width=1200,
+        height=1000
+    ).interactive().facet(
+    column='author:N'
+)
+    chart.save(str(Path(path_to_outputs) / f'classification_visualization__{metric}.html'))
+
+sys.exit()
 
 for layer_type_ind, (layer_type, author_dict) in enumerate(reshaped_data.items()):
     for author_ind, (author, scores_df) in enumerate(author_dict.items()):

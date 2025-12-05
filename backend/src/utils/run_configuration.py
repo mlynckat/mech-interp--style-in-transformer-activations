@@ -1,3 +1,12 @@
+"""
+Configuration classes for model, SAE, and dataset settings.
+
+This module defines dataclasses for configuring various aspects of the SAE analysis pipeline:
+- ModelConfig: Model-specific settings and layer configurations
+- SAELayerConfig: SAE layer configuration with canonical release support
+- DatasetConfig: Dataset-specific settings and constraints
+"""
+
 from typing import List, Optional
 from pydantic import Field
 from dataclasses import dataclass
@@ -27,9 +36,9 @@ class ModelConfig:
                 logger.warning(f"{len_initial - len(self.layer_indices)} layer indices are out of range for model {self.model_name}. Removing them.")
         
         if self.layer_types is None:
-            if self.model_name == "google/gemma-2-9b-it" or self.model_name == "google/gemma-2-2b"  :
+            if self.model_name == "google/gemma-2-2b":
                 self.layer_types = ["res", "mlp", "att"]
-            elif self.model_name == "google/gemma-2-9b":
+            elif self.model_name == "google/gemma-2-9b" or self.model_name == "google/gemma-2-9b-it":
                 self.layer_types = ["res"]
             else:
                 raise ValueError(f"Model {self.model_name} is not supported.")
@@ -58,13 +67,13 @@ class SAELayerConfig:
                     self.release_name = "gemma-scope-2b-pt-att-canonical"
                 else:
                     raise ValueError(f"Unknown layer_type {self.layer_type}. Only res, mlp, and att are supported for google/gemma-2-2b.")
-            elif self.model_name == "google/gemma-2-9b":
+            elif self.model_name == "google/gemma-2-9b" or self.model_name == "google/gemma-2-9b-it":
                 if self.layer_type == "res":
                     self.release_name = "gemma-scope-9b-pt-res-canonical"
                 else:
-                    raise ValueError(f"Unknown layer_type {self.layer_type}. Only res are supported for google/gemma-2-9b in canonical releases.")
+                    raise ValueError(f"Unknown layer_type {self.layer_type}. Only res are supported for google/gemma-2-9b and google/gemma-2-9b-it in canonical releases.")
             else:
-                raise ValueError(f"Unknown model_name {self.model_name}. Only google/gemma-2-2b and google/gemma-2-9b are supported.")
+                raise ValueError(f"Unknown model_name {self.model_name}. Only google/gemma-2-2b, google/gemma-2-9b, and google/gemma-2-9b-it are supported.")
             # Build the sae_id path: canonical is defined per layer/width
             self.sae_id = f"layer_{self.layer_index}/width_{self.width}/canonical"
         else:

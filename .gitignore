@@ -1,5 +1,6 @@
 # Data directories
 data/
+wandb/
 
 # Model files and checkpoints
 *.pth

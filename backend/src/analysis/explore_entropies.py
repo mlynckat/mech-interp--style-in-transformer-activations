@@ -13,6 +13,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 from backend.src.utils.shared_utilities import EntropyFilenamesLoader, TokenandFullTextFilenamesLoader
+from backend.src.analysis.analysis_run_tracking import (
+    get_data_and_output_paths,
+    AnalysisRunTracker
+)
 
 
 def create_heatmap(entropy: np.ndarray, tokens: List[List[str]], author: str, entropy_type: str, path_to_save_heatmap: str, prompted: str):
@@ -64,9 +68,18 @@ def retrieve_doc_tok_positions_of_improved_entropies(entropy_diffs: np.ndarray):
 def parse_arguments():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path_to_data", type=str, default="data/raw_features/AuthorMixPolitics500canonical-9b", help="Path to the data")
-    parser.add_argument("--path_to_outputs", type=str, default="data/output_data", help="Path to the outputs")
-    parser.add_argument("--run_name", type=str, default="explore_entropies_Politics500canonical-9b", help="The name of the run to create a folder in outputs")
+    parser.add_argument(
+        "--run_id",
+        type=str,
+        default=None,
+        help="Activation run ID (takes precedence over --path_to_data)"
+    )
+    parser.add_argument(
+        "--path_to_data",
+        type=str,
+        default=None,
+        help="Path to the data (required if --run_id not provided)"
+    )
     parser.add_argument(
         "--include_authors",
         type=str,
@@ -74,15 +87,43 @@ def parse_arguments():
         default=None,
         help="The authors to include in the analysis"
     )
-    return parser.parse_args()
+    
+    args = parser.parse_args()
+    
+    # Validate that either run_id or path_to_data is provided
+    if not args.run_id and not args.path_to_data:
+        parser.error("Either --run_id or --path_to_data must be provided")
+    
+    return args
 
 def main():
     args = parse_arguments()
+    
+    # Get data and output paths
+    data_path, output_path, activation_run_info = get_data_and_output_paths(
+        run_id=args.run_id,
+        data_path=args.path_to_data,
+        analysis_type="entropy_exploration",
+        run_name_override=None
+    )
+    
+    # Register analysis run
+    analysis_tracker = AnalysisRunTracker()
+    activation_run_id = activation_run_info.get('id') if activation_run_info else None
+    if activation_run_id:
+        analysis_id = analysis_tracker.register_analysis(
+            activation_run_id=activation_run_id,
+            analysis_type="entropy_exploration",
+            data_path=str(data_path),
+            output_path=str(output_path)
+        )
+        logger.info(f"Registered analysis run with ID: {analysis_id}")
+    
+    path_to_data = str(data_path)
+    path_to_outputs = str(output_path)
 
-    os.makedirs(Path(args.path_to_outputs) / f"{args.run_name}", exist_ok=True)
-
-    entropies_filenames_structured = EntropyFilenamesLoader(data_dir=args.path_to_data, include_authors=args.include_authors).get_structured_filenames()
-    tokens_and_full_text_filenames_structured = TokenandFullTextFilenamesLoader(data_dir=args.path_to_data, include_authors=args.include_authors).get_structured_filenames()
+    entropies_filenames_structured = EntropyFilenamesLoader(data_dir=Path(path_to_data), include_authors=args.include_authors).get_structured_filenames()
+    tokens_and_full_text_filenames_structured = TokenandFullTextFilenamesLoader(data_dir=Path(path_to_data), include_authors=args.include_authors).get_structured_filenames()
 
 
     for entropy_type, authors_items in entropies_filenames_structured.items():
@@ -90,15 +131,15 @@ def main():
             filename_prompted = prompted_items["prompted"]
             filename_baseline = prompted_items["baseline"]
 
-            entropy_prompted = np.load(Path(args.path_to_data) / filename_prompted)
-            entropy_baseline = np.load(Path(args.path_to_data) / filename_baseline)
+            entropy_prompted = np.load(Path(path_to_data) / filename_prompted)
+            entropy_baseline = np.load(Path(path_to_data) / filename_baseline)
 
-            with open(Path(args.path_to_data) / tokens_and_full_text_filenames_structured["tokens"][author]["prompted"], "r", encoding="utf-8") as f:
+            with open(Path(path_to_data) / tokens_and_full_text_filenames_structured["tokens"][author]["prompted"], "r", encoding="utf-8") as f:
                 tokens_prompted = json.load(f)
                 tokens_prompted_clean = []
                 for doc in tokens_prompted:
                     tokens_prompted_clean.append([token for token in doc if token != "<bos>" and token != "<pad>"])
-            with open(Path(args.path_to_data) / tokens_and_full_text_filenames_structured["tokens"][author]["baseline"], "r", encoding="utf-8") as f:
+            with open(Path(path_to_data) / tokens_and_full_text_filenames_structured["tokens"][author]["baseline"], "r", encoding="utf-8") as f:
                 tokens_baseline = json.load(f)
                 tokens_baseline_clean = []
                 for doc in tokens_baseline:
@@ -115,8 +156,8 @@ def main():
             logger.info(f"{entropy_type} for {author} baseline: shape {entropy_baseline.shape}")
 
             for prompted, entropy in zip(["prompted", "baseline"], [entropy_prompted, entropy_baseline]):
-                create_heatmap(entropy, tokens, author, entropy_type, Path(args.path_to_outputs) / f"{args.run_name}", prompted)
-            create_heatmap(entropy_prompted-entropy_baseline, tokens, author, entropy_type, Path(args.path_to_outputs) / f"{args.run_name}", "prompted-baseline")
+                create_heatmap(entropy, tokens, author, entropy_type, Path(path_to_outputs), prompted)
+            create_heatmap(entropy_prompted-entropy_baseline, tokens, author, entropy_type, Path(path_to_outputs), "prompted-baseline")
 
 
 if __name__ == "__main__":

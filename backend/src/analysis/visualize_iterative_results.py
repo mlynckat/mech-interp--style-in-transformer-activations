@@ -13,11 +13,9 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from collections import defaultdict
 import pandas as pd
 import altair as alt
-import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # Set up logging
 logging.basicConfig(
@@ -96,7 +94,7 @@ def parse_arguments():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data/output_data/AuthorMix/google_gemma-2-9b/politics_500_iterative_variance_threshold",
+        default="data/output_data/AuthorMix/google_gemma-2-2b/politics_500_dense_features",
         help="Directory containing JSON result files"
     )
     parser.add_argument(
@@ -255,30 +253,29 @@ def create_interactive_chart(
     
     # Create selection for interactivity
     # Author selection - click on legend to toggle
-    author_selection = alt.selection_multi(
-        fields=['author'],
-        bind='legend',
-        name='author_select'
+    author_selection = alt.param(
+        name='author_select',
+        select={'type': 'point', 'fields': ['author']},
+        bind='legend'
     )
     
     # Layer type selection - click on legend to toggle
-    layer_type_selection = alt.selection_multi(
-        fields=['layer_type'],
-        bind='legend',
-        name='layer_type_select'
+    layer_type_selection = alt.param(
+        name='layer_type_select',
+        select={'type': 'point', 'fields': ['layer_type']},
+        bind='legend'
     )
     
     # Layer index selection - click on legend to toggle
-    layer_ind_selection = alt.selection_multi(
-        fields=['layer_ind'],
-        bind='legend',
-        name='layer_ind_select'
+    layer_ind_selection = alt.param(
+        name='layer_ind_select',
+        select={'type': 'point', 'fields': ['layer_ind']},
+        bind='legend'
     )
     
     # Create the base chart with conditional opacity based on all selections
     base = alt.Chart(df).mark_line(
-        point=True,
-        size=2
+        point=True
     ).encode(
         x=alt.X('n_features:Q',
                 scale=alt.Scale(type='log'),
@@ -316,10 +313,10 @@ def create_interactive_chart(
             alt.Tooltip(f'{metric}:Q', title=metric_label, format='.4f')
         ]
     ).properties(
-        width=900,
-        height=500,
+        width=1500,
+        height=1000,
         title=f'{metric_label} vs Number of Features (Iterative Variance Threshold)'
-    ).add_selection(
+    ).add_params(
         author_selection,
         layer_type_selection,
         layer_ind_selection
@@ -330,7 +327,7 @@ def create_interactive_chart(
         bind='scales',
         encodings=['x', 'y']
     )
-    base = base.add_selection(zoom)
+    base = base.add_params(zoom)
     
     return base
 
@@ -369,34 +366,40 @@ def create_comparison_chart(df: pd.DataFrame) -> alt.Chart:
     )
     
     # Create selections
-    metric_selection = alt.selection_multi(
-        fields=['metric'],
-        bind='legend',
-        name='metric_select'
+    metric_selection = alt.param(
+        name='metric_select',
+        select={'type': 'point', 'fields': ['metric']},
+        bind='legend'
     )
     
-    author_selection = alt.selection_multi(
-        fields=['author'],
-        bind='legend',
-        name='author_select'
+    author_selection = alt.param(
+        name='author_select',
+        select={'type': 'point', 'fields': ['author']},
+        bind='legend'
     )
     
-    layer_type_selection = alt.selection_multi(
-        fields=['layer_type'],
-        bind='legend',
-        name='layer_type_select'
+    layer_type_selection = alt.param(
+        name='layer_type_select',
+        select={'type': 'point', 'fields': ['layer_type']},
+        bind='legend'
     )
     
-    layer_ind_selection = alt.selection_multi(
-        fields=['layer_ind'],
-        bind='legend',
-        name='layer_ind_select'
+    layer_ind_selection = alt.param(
+        name='layer_ind_select',
+        select={'type': 'point', 'fields': ['layer_ind']},
+        bind='legend'
     )
+    
+    # Define marker sizes for layer types
+    size_map = {
+        'res': 100,
+        'mlp': 200,
+        'att': 300
+    }
     
     # Create chart
     chart = alt.Chart(df_melted).mark_line(
-        point=True,
-        size=2
+        point=True
     ).encode(
         x=alt.X('n_features:Q',
                 scale=alt.Scale(type='log'),
@@ -408,8 +411,12 @@ def create_comparison_chart(df: pd.DataFrame) -> alt.Chart:
                        legend=alt.Legend(title='Metric (click to toggle)')),
         strokeDash=alt.StrokeDash('author:N',
                                   legend=alt.Legend(title='Author (click to toggle)')),
-        shape=alt.Shape('layer_type:N',
-                       legend=alt.Legend(title='Layer Type (click to toggle)')),
+        size=alt.Size('layer_type:N',
+                     scale=alt.Scale(
+                         domain=list(size_map.keys()),
+                         range=list(size_map.values())
+                     ),
+                     legend=alt.Legend(title='Layer Type (click to toggle)')),
         detail='author_layer_type:N',
         opacity=alt.condition(
             metric_selection & author_selection & layer_type_selection & layer_ind_selection,
@@ -428,7 +435,7 @@ def create_comparison_chart(df: pd.DataFrame) -> alt.Chart:
         width=900,
         height=500,
         title='All Metrics Comparison (Click legends to toggle)'
-    ).add_selection(
+    ).add_params(
         metric_selection,
         author_selection,
         layer_type_selection,
@@ -437,7 +444,7 @@ def create_comparison_chart(df: pd.DataFrame) -> alt.Chart:
     
     # Add zoom
     zoom = alt.selection_interval(bind='scales', encodings=['x', 'y'])
-    chart = chart.add_selection(zoom)
+    chart = chart.add_params(zoom)
     
     return chart
 
@@ -455,23 +462,30 @@ def create_feature_reduction_chart(df: pd.DataFrame) -> alt.Chart:
     logger.info("Creating feature reduction chart")
     
     # Create selections
-    author_selection = alt.selection_multi(
-        fields=['author'],
-        bind='legend',
-        name='author_select'
+    author_selection = alt.param(
+        name='author_select',
+        select={'type': 'point', 'fields': ['author']},
+        bind='legend'
     )
     
-    layer_type_selection = alt.selection_multi(
-        fields=['layer_type'],
-        bind='legend',
-        name='layer_type_select'
+    layer_type_selection = alt.param(
+        name='layer_type_select',
+        select={'type': 'point', 'fields': ['layer_type']},
+        bind='legend'
     )
     
-    layer_ind_selection = alt.selection_multi(
-        fields=['layer_ind'],
-        bind='legend',
-        name='layer_ind_select'
+    layer_ind_selection = alt.param(
+        name='layer_ind_select',
+        select={'type': 'point', 'fields': ['layer_ind']},
+        bind='legend'
     )
+    
+    # Define marker sizes for layer types
+    size_map = {
+        'res': 100,
+        'mlp': 200,
+        'att': 300
+    }
     
     chart = alt.Chart(df).mark_line(
         point=True
@@ -485,8 +499,8 @@ def create_feature_reduction_chart(df: pd.DataFrame) -> alt.Chart:
                        legend=alt.Legend(title='Author (click to toggle)')),
         strokeDash=alt.StrokeDash('layer_type:N',
                                   legend=alt.Legend(title='Layer Type (click to toggle)')),
-        shape=alt.Shape('layer_ind:N',
-                       legend=alt.Legend(title='Layer Index (click to toggle)', symbolLimit=50)),
+        size=alt.Size('layer_ind:N',
+                     legend=alt.Legend(title='Layer Index (click to toggle)', symbolLimit=50)),
         detail='author_layer_type:N',
         opacity=alt.condition(
             author_selection & layer_type_selection & layer_ind_selection,
@@ -504,7 +518,7 @@ def create_feature_reduction_chart(df: pd.DataFrame) -> alt.Chart:
         width=900,
         height=400,
         title='Feature Reduction Progress (Click legends to toggle)'
-    ).add_selection(
+    ).add_params(
         author_selection,
         layer_type_selection,
         layer_ind_selection
@@ -512,14 +526,27 @@ def create_feature_reduction_chart(df: pd.DataFrame) -> alt.Chart:
     
     # Add zoom
     zoom = alt.selection_interval(bind='scales', encodings=['x', 'y'])
-    chart = chart.add_selection(zoom)
+    chart = chart.add_params(zoom)
     
     return chart
 
 
-def main():
-    """Main execution function."""
-    args = parse_arguments()
+def main(args=None):
+    """
+    Main execution function.
+    
+    Args:
+        args: Optional arguments object. If None, will parse from command line.
+    """
+    if args is None:
+        args = parse_arguments()
+    elif isinstance(args, dict):
+        # Convert dict to argparse-like object
+        class Args:
+            def __init__(self, d):
+                for k, v in d.items():
+                    setattr(self, k, v)
+        args = Args(args)
     
     data_dir = Path(args.data_dir)
     

@@ -28,6 +28,10 @@ from backend.src.utils.shared_utilities import (
     ActivationFilenamesLoader,
     DataLoader
 )
+from backend.src.analysis.analysis_run_tracking import (
+    get_data_and_output_paths,
+    AnalysisRunTracker
+)
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -38,22 +42,16 @@ def parse_arguments():
     """Parse arguments for feature importance analysis"""
     parser = argparse.ArgumentParser(description="SAE Feature Importance Analysis Tool")
     parser.add_argument(
+        "--run_id",
+        type=str,
+        default=None,
+        help="Activation run ID (takes precedence over --path_to_data)"
+    )
+    parser.add_argument(
         "--path_to_data",
         type=str,
-        default="data/raw_features/news/politics/google_gemma-2-9b/politics_500",
-        help="Directory containing raw features"
-    )
-    parser.add_argument(
-        "--path_to_outputs",
-        type=str,
-        default="data/output_data/news/politics/google_gemma-2-9b/",
-        help="Output directory for results"
-    )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        default="politics_500",
-        help="The name of the run to create a folder in outputs"
+        default=None,
+        help="Directory containing raw features (required if --run_id not provided)"
     )
     parser.add_argument(
         "--include_authors",
@@ -465,10 +463,38 @@ def main():
         level=logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+    
+    # Get data and output paths
+    data_path, output_path, activation_run_info = get_data_and_output_paths(
+        run_id=args.run_id,
+        data_path=args.path_to_data,
+        analysis_type="feature_selection",
+        run_name_override=None
+    )
+    
+    # Register analysis run
+    analysis_tracker = AnalysisRunTracker()
+    activation_run_id = activation_run_info.get('id') if activation_run_info else None
+    if activation_run_id:
+        analysis_id = analysis_tracker.register_analysis(
+            activation_run_id=activation_run_id,
+            analysis_type="feature_selection",
+            data_path=str(data_path),
+            output_path=str(output_path)
+        )
+        logger.info(f"Registered analysis run with ID: {analysis_id}")
+    
+    path_to_data = str(data_path)
+    path_to_outputs = str(output_path)
+    run_name = "feature_selection_analysis"  # Keep for compatibility with existing code
 
-    os.makedirs(Path(args.path_to_outputs) / f"{args.run_name}", exist_ok=True)
-
-    activation_filenames_structured = ActivationFilenamesLoader(data_dir=args.path_to_data, include_authors=args.include_authors, include_layer_types=args.include_layer_types, include_layer_inds=args.include_layer_inds, include_prompted=args.include_prompted).get_structured_filenames()
+    activation_filenames_structured = ActivationFilenamesLoader(
+        data_dir=Path(path_to_data), 
+        include_authors=args.include_authors, 
+        include_layer_types=args.include_layer_types, 
+        include_layer_inds=args.include_layer_inds, 
+        include_prompted=args.include_prompted
+    ).get_structured_filenames()
 
     classification_results = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))))
     
@@ -476,15 +502,15 @@ def main():
         for layer_ind, author_filename_dict in layer_ind_dict.items():
 
 
-            if os.path.exists(Path(args.path_to_outputs) / f"{args.run_name}" / f"classification_results.json"):
-                with open(Path(args.path_to_outputs) / f"{args.run_name}" / f"classification_results.json", "r+") as f:
+            if os.path.exists(Path(path_to_outputs) / f"{run_name}" / f"classification_results.json"):
+                with open(Path(path_to_outputs) / f"{run_name}" / f"classification_results.json", "r+") as f:
                     classification_results_loaded = json.load(f)
 
                 if layer_type in classification_results_loaded and layer_ind in classification_results_loaded[layer_type]:
                     logger.info(f"Classification results already computed for {layer_type} {layer_ind}")
                     continue
 
-            train_activations, test_activations, train_labels, test_labels, int_to_author, train_metadata, test_metadata = retrieve_and_combine_author_data(author_filename_dict, args.path_to_data, binary=True, from_token=args.from_token)
+            train_activations, test_activations, train_labels, test_labels, int_to_author, train_metadata, test_metadata = retrieve_and_combine_author_data(author_filename_dict, path_to_data, binary=True, from_token=args.from_token)
 
             most_important_features = defaultdict(lambda: defaultdict(list))
 
@@ -522,12 +548,12 @@ def main():
                 # Save updated metadata after variance threshold filtering
                 save_updated_metadata(
                     features_data_variance_threshold.train_metadata,
-                    Path(args.path_to_outputs) / f"{args.run_name}" / f"train_metadata_variance_threshold__{layer_type}__{layer_ind}__{author}.json",
+                    Path(path_to_outputs) / f"{run_name}" / f"train_metadata_variance_threshold__{layer_type}__{layer_ind}__{author}.json",
                     f"After VarianceThreshold for {author} {layer_type} {layer_ind}"
                 )
                 save_updated_metadata(
                     features_data_variance_threshold.test_metadata,
-                    Path(args.path_to_outputs) / f"{args.run_name}" / f"test_metadata_variance_threshold__{layer_type}__{layer_ind}__{author}.json",
+                    Path(path_to_outputs) / f"{run_name}" / f"test_metadata_variance_threshold__{layer_type}__{layer_ind}__{author}.json",
                     f"After VarianceThreshold for {author} {layer_type} {layer_ind}"
                 )
 
@@ -535,11 +561,11 @@ def main():
                 logger.info(f"Fitting SVM")
                 svm.fit(features_data_variance_threshold.train_data, features_data_variance_threshold.train_labels)
                 labels_predicted = svm.predict(features_data_variance_threshold.test_data)
-                visualize_results_with_heatmap(labels_predicted, features_data_variance_threshold.test_labels, features_data_variance_threshold.test_metadata, f"SVM classification results for {author} {layer_type} {layer_ind} Variance Threshold features", Path(args.path_to_outputs) / f"{args.run_name}" / f"svm_classification_results__variance_threshold__{layer_type}__{layer_ind}__{author}___{args.include_prompted}.png")
+                visualize_results_with_heatmap(labels_predicted, features_data_variance_threshold.test_labels, features_data_variance_threshold.test_metadata, f"SVM classification results for {author} {layer_type} {layer_ind} Variance Threshold features", Path(path_to_outputs) / f"{run_name}" / f"svm_classification_results__variance_threshold__{layer_type}__{layer_ind}__{author}___{args.include_prompted}.png")
                 classification_report_svm = classification_report(features_data_variance_threshold.test_labels, labels_predicted, output_dict=True)
                 logger.info(f"SVM classification report: {classification_report_svm}")
                 classification_report_df = pd.DataFrame(classification_report_svm)
-                classification_report_df.to_csv(Path(args.path_to_outputs) / f"{args.run_name}" / f"classification_report__svm__{layer_type}__{layer_ind}__{author}__variance_threshold.csv")
+                classification_report_df.to_csv(Path(path_to_outputs) / f"{run_name}" / f"classification_report__svm__{layer_type}__{layer_ind}__{author}__variance_threshold.csv")
 
                 classification_results[layer_type][layer_ind][author]["variance_threshold"]["SVM"]["precision__class_1"] = classification_report_svm["1"]["precision"]
                 classification_results[layer_type][layer_ind][author]["variance_threshold"]["SVM"]["recall__class_1"] = classification_report_svm["1"]["recall"]
@@ -554,12 +580,12 @@ def main():
                 # Save metadata after sequential feature selection
                 save_updated_metadata(
                     features_data_sequential_feature_selector.train_metadata,
-                    Path(args.path_to_outputs) / f"{args.run_name}" / f"train_metadata_sequential__{layer_type}__{layer_ind}__{author}.json",
+                    Path(path_to_outputs) / f"{run_name}" / f"train_metadata_sequential__{layer_type}__{layer_ind}__{author}.json",
                     f"After SequentialFeatureSelector for {author} {layer_type} {layer_ind}"
                 )
                 save_updated_metadata(
                     features_data_sequential_feature_selector.test_metadata,
-                    Path(args.path_to_outputs) / f"{args.run_name}" / f"test_metadata_sequential__{layer_type}__{layer_ind}__{author}.json",
+                    Path(path_to_outputs) / f"{run_name}" / f"test_metadata_sequential__{layer_type}__{layer_ind}__{author}.json",
                     f"After SequentialFeatureSelector for {author} {layer_type} {layer_ind}"
                 )
 
@@ -580,7 +606,7 @@ def main():
                 classification_report_logreg = classification_report(features_data_sequential_feature_selector.test_labels, labels_predicted, output_dict=True)
                 logger.info(f"LogisticRegression classification report: {classification_report_logreg}")
                 classification_report_df = pd.DataFrame(classification_report_logreg)
-                classification_report_df.to_csv(Path(args.path_to_outputs) / f"{args.run_name}" / f"classification_report__logreg__{layer_type}__{layer_ind}__{author}__sequential_feature_selector.csv")
+                classification_report_df.to_csv(Path(path_to_outputs) / f"{run_name}" / f"classification_report__logreg__{layer_type}__{layer_ind}__{author}__sequential_feature_selector.csv")
 
                 classification_results[layer_type][layer_ind][author]["sequential_feature_selector"]["LogisticRegression"]["precision__class_1"] = classification_report_logreg["1"]["precision"]
                 classification_results[layer_type][layer_ind][author]["sequential_feature_selector"]["LogisticRegression"]["recall__class_1"] = classification_report_logreg["1"]["recall"]
@@ -603,7 +629,7 @@ def main():
                 classification_report_svm = classification_report(features_data_sequential_feature_selector.test_labels, labels_predicted_svm, output_dict=True)
                 logger.info(f"SVM classification report: {classification_report_svm}")
                 classification_report_df = pd.DataFrame(classification_report_svm)
-                classification_report_df.to_csv(Path(args.path_to_outputs) / f"{args.run_name}" / f"classification_report__svm__{layer_type}__{layer_ind}__{author}__sequential_feature_selector.csv")
+                classification_report_df.to_csv(Path(path_to_outputs) / f"{run_name}" / f"classification_report__svm__{layer_type}__{layer_ind}__{author}__sequential_feature_selector.csv")
 
                 classification_results[layer_type][layer_ind][author]["sequential_feature_selector"]["SVM"]["precision__class_1"] = classification_report_svm["1"]["precision"]
                 classification_results[layer_type][layer_ind][author]["sequential_feature_selector"]["SVM"]["recall__class_1"] = classification_report_svm["1"]["recall"]
@@ -618,13 +644,13 @@ def main():
                     classification_results[layer_type][layer_ind][author]["RandomForest"][score] = np.mean(cv_classification_random_forest_score[f"test_{score}"])"""
 
             # Save most important features
-            with open(Path(args.path_to_outputs) / f"{args.run_name}" / f"most_important_features__{layer_type}__{layer_ind}.json", "w") as f:
+            with open(Path(path_to_outputs) / f"{run_name}" / f"most_important_features__{layer_type}__{layer_ind}.json", "w") as f:
                 json.dump(most_important_features, f, indent=4)
 
                     
 
             # Save classification results
-            with open(Path(args.path_to_outputs) / f"{args.run_name}" / f"classification_results.json", "w") as f:
+            with open(Path(path_to_outputs) / f"{run_name}" / f"classification_results.json", "w") as f:
                 json.dump(classification_results, f, indent=4)
     
 

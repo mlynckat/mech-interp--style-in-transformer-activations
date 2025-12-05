@@ -15,9 +15,13 @@ import altair as alt
 from scipy.stats import pointbiserialr
 
 # Import shared utilities
-from brain.my_scripts.shared_utilities import (
+from backend.src.utils.shared_utilities import (
     AuthorColorManager,
     BaseAnalyzer
+)
+from backend.src.analysis.analysis_run_tracking import (
+    get_data_and_output_paths,
+    AnalysisRunTracker
 )
 
 
@@ -461,23 +465,19 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     parser = argparse.ArgumentParser(description="SAE Feature Importance Analysis Tool")
+    
+    # Run configuration
     parser.add_argument(
-        "--dir_path",
+        "--run_id",
         type=str,
-        default="sae_features/reduced",
-        help="Directory containing SAE activation files"
+        default=None,
+        help="Activation run ID (takes precedence over --path_to_data)"
     )
     parser.add_argument(
-        "--output_dir",
+        "--path_to_data",
         type=str,
-        default="sae_features/outputs",
-        help="Output directory for results"
-    )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        default="feature_importance_analysis",
-        help="The name of the run to create a folder in outputs"
+        default=None,
+        help="Directory containing SAE activation files (required if --run_id not provided)"
     )
     parser.add_argument(
         "--include_authors",
@@ -504,14 +504,41 @@ def main():
     
     args = parser.parse_args()
     
+    # Validate that either run_id or path_to_data is provided
+    if not args.run_id and not args.path_to_data:
+        parser.error("Either --run_id or --path_to_data must be provided")
+    
+    # Get data and output paths
+    data_path, output_path, activation_run_info = get_data_and_output_paths(
+        run_id=args.run_id,
+        data_path=args.path_to_data,
+        analysis_type="feature_importance",
+        run_name_override=None
+    )
+    
+    # Register analysis run
+    analysis_tracker = AnalysisRunTracker()
+    activation_run_id = activation_run_info.get('id') if activation_run_info else None
+    if activation_run_id:
+        analysis_id = analysis_tracker.register_analysis(
+            activation_run_id=activation_run_id,
+            analysis_type="feature_importance",
+            data_path=str(data_path),
+            output_path=str(output_path)
+        )
+        logger.info(f"Registered analysis run with ID: {analysis_id}")
+    
+    dir_path = str(data_path)
+    output_dir = str(output_path)
+    
     # Initialize analyzer
-    analyzer = FeatureImportanceAnalyzer(args.dir_path, args.output_dir, args.run_name)
+    analyzer = FeatureImportanceAnalyzer(dir_path, output_dir, "")
     
     # Get list of files to analyze
-    filenames = [f for f in os.listdir(args.dir_path) if f.endswith(".npz")]
+    filenames = [f for f in os.listdir(dir_path) if f.endswith(".npz")]
 
-    entropies_files = [f for f in os.listdir(args.dir_path) if f.endswith(".npy") and "entropy" in f and "cross" not in f]
-    cross_entropies_files = [f for f in os.listdir(args.dir_path) if f.endswith(".npy") and "cross_entropy" in f]
+    entropies_files = [f for f in os.listdir(dir_path) if f.endswith(".npy") and "entropy" in f and "cross" not in f]
+    cross_entropies_files = [f for f in os.listdir(dir_path) if f.endswith(".npy") and "cross_entropy" in f]
     
     # Apply filters using the base analyzer method
     filenames = analyzer.filter_filenames(

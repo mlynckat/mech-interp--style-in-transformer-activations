@@ -77,11 +77,8 @@ def load_news_data(dataset_config, category_name, n_docs=None, exclude_authors=N
 
     author_to_docs = defaultdict(list)
     author_list = []
-    total_docs_processed = 0
 
     for i, doc in enumerate(dataset):
-        if n_docs is not None and total_docs_processed >= n_docs:
-            break
 
         author = doc['style']  # 'style' column contains author info
 
@@ -102,13 +99,26 @@ def load_news_data(dataset_config, category_name, n_docs=None, exclude_authors=N
 
         # Add document to author's list
         author_to_docs[author].append((i, doc))
-        total_docs_processed += 1
+        
+    
+    # Sort authors list by number of documents
+    author_list.sort(key=lambda x: len(author_to_docs[x]), reverse=True)
+
+    # Keep only the top n authors until we have n_docs documents
+    if n_docs is not None:
+        filtered_author_list = []
+        total_docs_processed = 0
+        while total_docs_processed < n_docs and len(author_list) > 0:
+            current_author = author_list.pop(0)
+            filtered_author_list.append(current_author)
+            total_docs_processed += len(author_to_docs[current_author])
+        author_list = filtered_author_list
+        author_to_docs = {author: docs for author, docs in author_to_docs.items() if author in filtered_author_list}
 
     dataset_config.max_n_docs_per_author = max(len(docs) for docs in author_to_docs.values())
     dataset_config.author_list = author_list
 
     # Log some info about the data organization
-    logger.info(f"Total documents processed: {total_docs_processed}")
     logger.info(f"Number of unique authors: {len(author_list)}")
 
     return author_to_docs, dataset_config

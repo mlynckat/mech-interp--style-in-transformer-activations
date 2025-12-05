@@ -75,4 +75,4 @@ done
 #export TORCH_USE_CUDA_DSA=1
 
 # run the workload
-python3 -m backend.src.get_features.get_classic_activations --layers 0 5 10 15 20 25 30 35 40 41 
+python3 -m backend.src.get_features.get_sae_features --layers 0 5 10 15 20 25 30 35 40 41 

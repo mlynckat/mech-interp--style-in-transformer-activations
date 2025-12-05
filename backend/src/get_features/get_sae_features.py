@@ -28,6 +28,7 @@ from sae_lens import SAE, HookedSAETransformer
 from backend.src.utils.load_dataset import load_news_data, load_AuthorMix_data
 from backend.src.utils.run_configuration import ModelConfig, SAELayerConfig, DatasetConfig
 from backend.src.utils.shared_utilities import ActivationMetadata, StorageFormat
+from backend.src.get_features.activation_tracking import get_tracker
 
 # Set up logging
 logging.basicConfig(
@@ -582,26 +583,22 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
 
         logger.info("Saving entropy and cross-entropy loss...")
         np.save(
-            os.path.join(save_dir, 
-                        f"sae_{parsed_args.setting}__{model_name_safe}__entropy__{author}.npy"),
+            save_dir / f"sae_{parsed_args.setting}__{model_name_safe}__entropy__{author}.npy",
             entropy_author
         )
         np.save(
-            os.path.join(save_dir,
-                        f"sae_{parsed_args.setting}__{model_name_safe}__cross_entropy_loss__{author}.npy"),
+            save_dir / f"sae_{parsed_args.setting}__{model_name_safe}__cross_entropy_loss__{author}.npy",
             cross_entropy_loss_author
         )
 
         # Save tokens and full texts
         logger.info("Saving tokens and full texts...")
 
-        with open(os.path.join(save_dir,
-                              f"sae_{parsed_args.setting}__{model_name_safe}__tokens__{author}.json"),
+        with open(save_dir / f"sae_{parsed_args.setting}__{model_name_safe}__tokens__{author}.json",
                  "w", encoding="utf-8") as f:
             json.dump(tokens_per_author, f, ensure_ascii=False, indent=4)
         
-        with open(os.path.join(save_dir,
-                              f"sae_{parsed_args.setting}__{model_name_safe}__full_texts__{author}.json"),
+        with open(save_dir / f"sae_{parsed_args.setting}__{model_name_safe}__full_texts__{author}.json",
                  "w", encoding="utf-8") as f:
             json.dump(full_texts_per_author, f, ensure_ascii=False, indent=4)
         
@@ -614,7 +611,7 @@ def run_inference_on_gpu(rank, author_subsets, parsed_args, author_to_docs, data
             for layeri, sae_id in zip(model_config.layer_indices, saes_ids[layer_type]):
                 base_filename = (f"sae_{parsed_args.setting}__{model_name_safe}__{layer_type}"
                                f"__activations__{author}__layer_{layeri}")
-                filepath = os.path.join(save_dir, base_filename)
+                filepath = save_dir / base_filename
                 
                 save_time, file_size = activations[layer_type][sae_id].save(
                     filepath=Path(filepath),
@@ -668,10 +665,15 @@ def main(parsed_args):
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
+    # Construct save directory path (relative to project root)
     model_name_safe = parsed_args.model.replace('/', '_')
-    dataset_dir = Path(parsed_args.dataset_name, parsed_args.category_name) if parsed_args.category_name is not None else Path(parsed_args.dataset_name)
-    save_dir = Path(parsed_args.output_dir, dataset_dir, model_name_safe, parsed_args.run_name)
-    os.makedirs(save_dir, exist_ok=True)
+    if parsed_args.category_name:
+        save_dir = Path(parsed_args.output_dir) / parsed_args.dataset_name / parsed_args.category_name / model_name_safe / parsed_args.run_name
+    else:
+        save_dir = Path(parsed_args.output_dir) / parsed_args.dataset_name / model_name_safe / parsed_args.run_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Data will be saved to: {save_dir}")
 
     dataset_config = DatasetConfig(dataset_name=parsed_args.dataset_name, min_length_doc=parsed_args.min_length_doc, max_n_docs_per_author=parsed_args.n_docs_per_author)
 
@@ -706,6 +708,26 @@ def main(parsed_args):
     
     total_time = time.time() - start_time
     logger.info(f"=== Total runtime: {total_time:.2f}s ({total_time/60:.2f} minutes) ===")
+    
+    # Register this run in the tracking system
+    try:
+        tracker = get_tracker()
+        run_id = tracker.register_run(
+            model=parsed_args.model,
+            dataset=parsed_args.dataset_name,
+            run_name=parsed_args.run_name,
+            layers=parsed_args.layers,
+            activation_path=str(save_dir),
+            category=parsed_args.category_name,
+            authors=dataset_config.author_list,
+            storage_format=parsed_args.storage_format,
+            n_docs_per_author=parsed_args.n_docs_per_author,
+            min_length_doc=parsed_args.min_length_doc,
+            setting=parsed_args.setting
+        )
+        logger.info(f"✓ Activation run registered with ID: {run_id}")
+    except Exception as e:
+        logger.warning(f"Failed to register activation run in tracking system: {e}")
 
             
 if __name__ == "__main__":
@@ -715,8 +737,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemma-2-2b",
-        choices=["google/gemma-2-2b", "google/gemma-2-9b"],
+        default="google/gemma-2-9b-it",
+        choices=["google/gemma-2-2b", "google/gemma-2-9b", "google/gemma-2-9b-it"],
         help="Model to use for feature extraction"
     )
     parser.add_argument(
@@ -737,20 +759,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="AuthorMix",
+        default="news",
         choices=["AuthorMix", "news"],
         help="Dataset to use"
     )
     parser.add_argument(
         "--category_name",
         type=str,
-        default=None,
+        default="politics",
         help="Category for news dataset"
     )
     parser.add_argument(
         "--n_docs",
         type=int,
-        default=None,
+        default=4000,
         help="Total number of documents to analyze"
     )
     parser.add_argument(
@@ -792,7 +814,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--storage_format",
         type=str,
-        default="dense",
+        default="sparse",
         choices=["dense", "sparse"],
         help="Storage format: 'dense' for full arrays, 'sparse' for sparse matrices"
     )
@@ -805,7 +827,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run_name",
         type=str,
-        default="politics_500_timing_test",
+        default="news_500_politics",
         help="Name of the run to create a folder in outputs"
     )
 

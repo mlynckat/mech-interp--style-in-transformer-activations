@@ -56,6 +56,10 @@ from backend.src.utils.shared_utilities import (
     ActivationMetadata,
     ClusterMetrics
 )
+from backend.src.analysis.analysis_run_tracking import (
+    get_data_and_output_paths,
+    AnalysisRunTracker
+)
 
 
 class Visualizer:
@@ -1034,29 +1038,49 @@ class SAEAnalyzer(BaseAnalyzer):
 def main() -> None:
     """Main entry point for SAE activation analysis."""
     args = _parse_arguments()
-    analyzer = SAEAnalyzer(args.dir_path, args.output_dir, args.run_name)
+    
+    # Get data and output paths
+    data_path, output_path, activation_run_info = get_data_and_output_paths(
+        run_id=args.run_id,
+        data_path=args.path_to_data,
+        analysis_type=args.mode,
+        run_name_override=args.run_name
+    )
+    
+    # Register analysis run
+    analysis_tracker = AnalysisRunTracker()
+    activation_run_id = activation_run_info.get('id') if activation_run_info else None
+    if activation_run_id:
+        analysis_id = analysis_tracker.register_analysis(
+            activation_run_id=activation_run_id,
+            analysis_type=args.mode,
+            data_path=str(data_path),
+            output_path=str(output_path)
+        )
+        logger.info(f"Registered analysis run with ID: {analysis_id}")
+    
+    analyzer = SAEAnalyzer(data_path, output_path, args.run_name or "")
 
     if args.filename:
         _analyze_single_file(analyzer, args.filename)
     else:
-        _analyze_multiple_files(analyzer, args)
+        _analyze_multiple_files(analyzer, data_path, args)
 
 def _parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="SAE Activation Analysis Tool")
     
     parser.add_argument(
-        "--dir_path",
+        "--run_id",
         type=str,
-        default="data/raw_features/news/politics/google_gemma-2-9b/politics_500",
-        help="Directory containing SAE activation files"
+        default=None,
+        help="Activation run ID (takes precedence over --path_to_data)"
     )
     parser.add_argument(
-        "--output_dir",
+        "--path_to_data",
         type=str,
-        nargs="+",
-        default="data/output_data/news/google_gemma-2-9b",
-        help="Output directory for results"
+        default=None,
+        help="Directory containing SAE activation files (required if --run_id not provided)"
     )
     parser.add_argument(
         "--filename",
@@ -1074,8 +1098,8 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--run_name",
         type=str,
-        default="politics_500",
-        help="Name of the run to create a folder in outputs"
+        default=None,
+        help="Optional run name override for output directory"
     )
     parser.add_argument(
         "--include_authors",
@@ -1100,15 +1124,21 @@ def _parse_arguments() -> argparse.Namespace:
         help="Layer indices to include in the analysis"
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # Validate that either run_id or path_to_data is provided
+    if not args.run_id and not args.path_to_data:
+        parser.error("Either --run_id or --path_to_data must be provided")
+    
+    return args
 
 def _analyze_single_file(analyzer: SAEAnalyzer, filename: str) -> None:
     """Analyze a single file."""
     analyzer.analyze_single_file(filename)
 
-def _analyze_multiple_files(analyzer: SAEAnalyzer, args: argparse.Namespace) -> None:
+def _analyze_multiple_files(analyzer: SAEAnalyzer, data_dir: Path, args: argparse.Namespace) -> None:
     """Analyze multiple files based on mode."""
-    filenames = _load_filenames(args)
+    filenames = _load_filenames(data_dir, args)
     logger.info(f"Loaded {len(filenames)} files") 
     print(filenames)              
     
@@ -1122,25 +1152,25 @@ def _analyze_multiple_files(analyzer: SAEAnalyzer, args: argparse.Namespace) -> 
         analyzer.analyze_detailed_counts(filenames)
 
     if args.mode in ["entropies", "all"]:
-        _analyze_entropies(analyzer, args, filenames)
+        _analyze_entropies(analyzer, data_dir, args, filenames)
 
     if args.mode in ["token_positions", "all"]:
         analyzer.analyze_token_positions(filenames)
 
-def _load_filenames(args: argparse.Namespace) -> Dict[str, Dict[str, Dict[str, str]]]:
+def _load_filenames(data_dir: Path, args: argparse.Namespace) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Load filenames using the filename loader with filters."""
     filename_loader = ActivationFilenamesLoader(
-        data_dir=Path(args.dir_path),
+        data_dir=data_dir,
         include_authors=args.include_authors,
         include_layer_types=args.include_layer_types,
         include_layer_inds=args.include_layer_inds
     )
     return filename_loader.get_structured_filenames()
 
-def _analyze_entropies(analyzer: SAEAnalyzer, args: argparse.Namespace, filenames: List[str]) -> None:
+def _analyze_entropies(analyzer: SAEAnalyzer, data_dir: Path, args: argparse.Namespace, filenames: List[str]) -> None:
     """Analyze entropy data."""
     entropy_loader = EntropyFilenamesLoader(
-        data_dir=Path(args.dir_path),
+        data_dir=data_dir,
         include_authors=args.include_authors
     )
     entropy_structured = entropy_loader.get_structured_filenames()
