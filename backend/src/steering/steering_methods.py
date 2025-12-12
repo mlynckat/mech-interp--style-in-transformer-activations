@@ -170,6 +170,51 @@ class HeuristicSteering(SteeringMechanism):
             delta_x = delta_x.expand_as(x)
             
         return delta_x
+
+    def compute_steering_with_alpha(
+        self, 
+        x: torch.Tensor,
+        alpha: float,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Compute steering using minimal L2 norm approach.
+        
+        Args:
+            x: Current SAE activations [batch, seq_len, sae_dim]
+            auto_tune: Whether to automatically tune alpha
+            decoder: (optional) SAE decoder for quality checking
+            original_reconstruction: (optional) Original decoded activations
+            history_feats: (optional) History of SAE features from all previous tokens [batch, n_tokens, sae_dim]: list of tensors
+            
+        Returns:
+            Steering vector delta_x
+        """
+        device = x.device
+        # Both mask and w are now full-size (num_features,), so element-wise multiply works
+        w_s = (self.mask * self.w).to(device)
+
+        
+        # Normalize by L2 norm
+        w_s_norm = torch.norm(w_s)
+        if w_s_norm < 1e-8:
+            return torch.zeros_like(x)
+        
+        normalized_steering = w_s / w_s_norm
+        
+        # Scale by alpha
+        # Broadcast to match input shape
+        delta_x = alpha * normalized_steering
+        # Expand dimensions to match [batch, seq_len, sae_dim]
+        while delta_x.ndim < x.ndim:
+            delta_x = delta_x.unsqueeze(0)
+        
+        # Ensure delta_x can broadcast to x's shape
+        # If x is [batch, seq_len, sae_dim] and delta_x is [1, 1, sae_dim], expand it
+        if delta_x.shape != x.shape:
+            delta_x = delta_x.expand_as(x)
+            
+        return delta_x
     
     def confidence_achieved(self, x_vector: torch.Tensor) -> bool:
         """

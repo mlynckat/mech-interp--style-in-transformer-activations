@@ -31,12 +31,12 @@ def get_prompts_for_test(article: str):
     print("-"*20)
     return response.output[0].content[0].text
 
-def main():
+def main(mode: str = "test"):
 
     base_dir = Path("data/steering/tests")
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    output_test_data = []
+    output_data = []
 
     X, y = DataReader.read_news_json_data()
 
@@ -47,22 +47,30 @@ def main():
             random_state=42,
             stratify=y,
         )
-    y_test_list = y_test.tolist()
-    X_test_list = X_test.tolist()
-    for i, article in tqdm(enumerate(X_test_list)):
+
+    if mode == "test":
+        y_list = y_test.tolist()
+        X_list = X_test.tolist()
+    elif mode == "train":
+        y_list = y_train.tolist()
+        X_list = X_train.tolist()
+    else:
+        raise ValueError(f"Invalid mode: {mode}. Should be 'test' or 'train'.")
+    
+    for i, article in tqdm(enumerate(X_list)):
         prompt = get_prompts_for_test(article)
-        output_test_data.append({
+        output_data.append({
             "article": article,
             "prompt": prompt,
-            "author": y_test_list[i],
+            "author": y_list[i],
         })
     
-    with open(base_dir / "prompts_test_data.json", "w") as f:
-        json.dump(output_test_data, f, indent=2, ensure_ascii=False)
+    with open(base_dir / f"prompts_{mode}_data.json", "w") as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    main()
+    main(mode="train")
 
 
     

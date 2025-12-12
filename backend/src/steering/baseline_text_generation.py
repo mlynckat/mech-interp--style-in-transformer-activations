@@ -15,8 +15,8 @@ login(token=os.environ["HF_TOKEN"])
 
 
 base_dir = Path("data/steering/tests")
-input_filename = "prompts_test_data.json"
-output_filename = "generated_texts__baseline.json"
+input_filename = "prompts_train_data.json"
+output_filename = "generated_training_texts__baseline.json"
 input_file = base_dir / input_filename
 output_file = base_dir / output_filename
 
@@ -70,7 +70,7 @@ output_data = []
 test_data = read_test_data()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-hf_model, hf_tokenizer = load_text_generation_model("google/gemma-2-9b-it", device)
+hf_model, hf_tokenizer = load_text_generation_model("Qwen/Qwen3-14B", device) # google/gemma-2-9b-it
 
 for prompt in tqdm(test_data):
     prompt_text = prompt["prompt"]
