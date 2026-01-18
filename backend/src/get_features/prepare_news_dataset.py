@@ -8,21 +8,25 @@ combines headline + article_text to create datasets structured like AuthorMix.
 import pandas as pd
 import numpy as np
 import os
+import sys
 import json
 import matplotlib.pyplot as plt
-import seaborn as sns
-from collections import defaultdict, Counter
 from pathlib import Path
 import warnings
 import logging
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from utils.plot_styling import PlotStyle, apply_style, create_figure
 
 # Set up logging
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
-# Set up plotting style
-plt.style.use('default')
-sns.set_palette("husl")
+# Apply global plot styling
+apply_style()
+
 
 def load_category_data(category_file):
     """Load and process a single category CSV file."""
@@ -59,6 +63,7 @@ def load_category_data(category_file):
         logger.error(f"  Error processing {category_file}: {e}")
         return None
 
+
 def create_authormix_structure(df, category_name):
     """Convert news dataset to AuthorMix-like structure."""
     authormix_data = []
@@ -75,7 +80,7 @@ def create_authormix_structure(df, category_name):
             
         for idx, row in group.iterrows():
             doc_data = {
-                'style': author,  # Combine category and author for unique style
+                'style': author,
                 'text':  row['headline'] + '. ' + row['text'],
                 'category': category_name,
                 'text_length_words': row['text_length_words']
@@ -84,81 +89,224 @@ def create_authormix_structure(df, category_name):
     
     return authormix_data
 
+
 def create_visualizations(authormix_data, category_name, save_dir):
-    """Create and save visualizations for the category dataset."""
+    """Create and save modern, publication-ready visualizations for a single category."""
     
-    # Create DataFrame for easier analysis
     df = pd.DataFrame(authormix_data)
-    
-    # Create output directory
     os.makedirs(save_dir, exist_ok=True)
     
-    # Set up the figure with 2 subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    style = PlotStyle()
     
-    # Plot 1: Number of documents per author (bar plot)
-    author_counts = df['style'].value_counts()
+    # Create figure with white background
+    fig, (ax1, ax2) = create_figure(1, 2, figsize=(12, 5))
+    plt.subplots_adjust(left=0.12, right=0.95, top=0.85, bottom=0.15, wspace=0.35)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Plot 1: Documents per author (Horizontal bar chart with gradient)
+    # ─────────────────────────────────────────────────────────────────────────
+    author_counts = df['style'].value_counts().head(15)
+    author_counts = author_counts.sort_values()
     
-    # Limit to top 20 authors for readability
-    top_authors = author_counts.head(20)
-    # logger.debug(top_authors)
+    n_bars = len(author_counts)
+    colors = style.get_gradient_colors(n_bars)
+
+    bars1 = ax1.barh(
+        range(len(author_counts)),
+        author_counts.values,
+        color=colors,
+        height=0.7,
+        edgecolor='none'
+    )
     
-    ax1.bar(top_authors.index, top_authors.values, color='skyblue', alpha=0.7)
-    ax1.set_xlabel('Authors (ranked by document count)', fontsize=12)
-    ax1.set_ylabel('Number of Documents', fontsize=12)
-    ax1.set_title(f'Top 20 Authors by Document Count - {category_name}', fontsize=14, fontweight='bold')
-    ax1.set_xticks(range(len(top_authors)))
-    ax1.set_xticklabels(top_authors.index, rotation=45, ha='right')
-    ax1.grid(axis='y', alpha=0.3)
+    # Style y-axis labels
+    ax1.set_yticks(range(len(author_counts)))
+    ax1.set_yticklabels(author_counts.index, fontsize=8)
     
-    # Add text with stats
-    total_authors = len(author_counts)
-    total_docs = len(df)
-    avg_docs_per_author = total_docs / total_authors
-    ax1.text(0.02, 0.98, f'Total Authors: {total_authors}\nTotal Documents: {total_docs}\nAvg Docs/Author: {avg_docs_per_author:.1f}', 
-             transform=ax1.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    # Add value labels on bars
+    style.add_bar_labels(ax1, bars1, author_counts.values, position='end')
     
-    # Plot 2: Document length distribution (histogram)
-    text_lengths = df['text_length_words']
+    # Apply axis styling
+    style.style_axis(
+        ax1,
+        title=f'Top Authors — {category_name.replace("_", " ").title()}',
+        xlabel='Number of documents',
+        grid_axis='x',
+        title_loc='center'
+    )
     
-    ax2.hist(text_lengths, bins=50, color='lightcoral', alpha=0.7, edgecolor='black', linewidth=0.5)
-    ax2.set_xlabel('Document Length (words)', fontsize=12)
-    ax2.set_ylabel('Frequency', fontsize=12)
-    ax2.set_title(f'Document Length Distribution - {category_name}', fontsize=14, fontweight='bold')
-    ax2.grid(axis='y', alpha=0.3)
+    ax1.set_xlim(0, max(author_counts.values) * 1.2)
+
+    # Metadata badge
+    style.add_metadata_badge(
+        ax1,
+        f'{df["style"].nunique()} authors · {len(df):,} docs',
+        loc='lower right'
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Plot 2: Document length distribution (Histogram with gradient)
+    # ─────────────────────────────────────────────────────────────────────────
+    lengths = df['text_length_words']
     
-    # Add statistics text
-    mean_length = text_lengths.mean()
-    median_length = text_lengths.median()
-    std_length = text_lengths.std()
-    ax2.text(0.98, 0.98, f'Mean: {mean_length:.0f} words\nMedian: {median_length:.0f} words\nStd: {std_length:.0f} words', 
-             transform=ax2.transAxes, verticalalignment='top', horizontalalignment='right',
-             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    # Clip at 95th percentile for better visualization
+    upper_bound = min(lengths.quantile(0.95), 2000)
+    clipped_lengths = lengths.clip(upper=upper_bound)
     
-    plt.tight_layout()
+    # Create histogram
+    bins = np.linspace(0, upper_bound, 35)
+    n, bins_out, patches = ax2.hist(
+        clipped_lengths,
+        bins=bins,
+        color=style.COLORS['primary'],
+        alpha=0.85,
+        edgecolor=style.COLORS['bg_white'],
+        linewidth=0.5
+    )
     
-    # Save the plot
-    plot_filename = f"{category_name}_stats.png"
-    plot_path = os.path.join(save_dir, plot_filename)
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    # Apply gradient to histogram bars
+    hist_colors = style.get_gradient_colors(len(patches))
+    for patch, color in zip(patches, hist_colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.85)
+
+    # Apply axis styling
+    style.style_axis(
+        ax2,
+        title='Document Length Distribution (Words)',
+        xlabel='Document length (words)',
+        ylabel='Frequency',
+        grid_axis='y',
+        title_loc='center'
+    )
+
+    # Reference lines with accent color
+    mean_val = lengths.mean()
+    median_val = lengths.median()
+
+    ax2.axvline(mean_val, linestyle='--', linewidth=2, 
+                color=style.COLORS['accent'], alpha=0.9, 
+                label=f'Mean: {mean_val:.0f}')
+    ax2.axvline(median_val, linestyle=':', linewidth=2, 
+                color=style.COLORS['accent_light'], alpha=0.9, 
+                label=f'Median: {median_val:.0f}')
+    
+    # Legend
+    legend = ax2.legend(
+        loc='upper right',
+        frameon=True,
+        facecolor=style.COLORS['bg_white'],
+        edgecolor=style.COLORS['border'],
+        fontsize=9
+    )
+    legend.get_frame().set_alpha(0.95)
+
+    # Save
+    plot_path = os.path.join(save_dir, f"{category_name}_stats.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', 
+                facecolor=style.COLORS['bg_white'])
     plt.close()
-    
+
     logger.info(f"  Saved visualization to {plot_path}")
-    
-    # Return summary statistics
-    stats = {
-        'category': category_name,
-        'total_authors': total_authors,
-        'total_documents': total_docs,
-        'avg_docs_per_author': avg_docs_per_author,
-        'mean_text_length': float(mean_length),
-        'median_text_length': float(median_length),
-        'std_text_length': float(std_length),
-        'min_text_length': int(text_lengths.min()),
-        'max_text_length': int(text_lengths.max())
+
+    return {
+        "category": category_name,
+        "total_authors": df['style'].nunique(),
+        "total_documents": len(df),
+        "avg_docs_per_author": len(df) / df['style'].nunique(),
+        "mean_text_length": float(mean_val),
+        "median_text_length": float(median_val),
+        "std_text_length": float(lengths.std()),
+        "min_text_length": int(lengths.min()),
+        "max_text_length": int(lengths.max()),
     }
+
+
+def create_overall_summary_plot(all_stats, stats_dir, top_n: int = 20):
+    """Create a modern summary dashboard across all categories."""
+
+    if not all_stats:
+        return
+
+    style = PlotStyle()
     
-    return stats
+    # Create DataFrame and keep only top N by total documents
+    stats_df = pd.DataFrame(all_stats)
+    stats_df = stats_df.nlargest(top_n, 'total_documents')
+    stats_df = stats_df.sort_values('total_documents', ascending=False)
+    
+    os.makedirs(stats_dir, exist_ok=True)
+
+    # Create figure
+    fig = plt.figure(figsize=(14, 10))
+    fig.patch.set_facecolor(style.COLORS['bg_white'])
+    
+    # Create grid layout
+    gs = fig.add_gridspec(2, 2, hspace=0.4, wspace=0.25,
+                          left=0.08, right=0.95, top=0.88, bottom=0.12)
+    
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    # Prepare labels
+    categories = [style.truncate_label(cat, max_len=14) 
+                  for cat in stats_df['category']]
+    x_pos = np.arange(len(categories))
+    
+    # Gradient colors for bars
+    bar_colors = style.get_gradient_colors(len(categories))
+
+    def plot_bars(ax, values, title, ylabel, show_error=False, error_vals=None):
+        """Helper function for consistent bar styling."""
+        bars = ax.bar(x_pos, values, color=bar_colors, width=0.75, edgecolor='none')
+        
+        if show_error and error_vals is not None:
+            ax.errorbar(
+                x_pos, values, yerr=error_vals * 0.5,
+                fmt='none', ecolor=style.COLORS['text_light'],
+                capsize=3, capthick=1, alpha=0.6
+            )
+        
+        style.style_axis(ax, title=title, ylabel=ylabel, grid_axis='y', title_loc='center')
+        
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(categories, rotation=45, ha='right', fontsize=8)
+        
+        # Add value labels
+        style.add_bar_labels(ax, bars, values, fontsize=7)
+        
+        # Adjust y-limit for labels
+        ax.set_ylim(0, max(values) * 1.18)
+        
+        return bars
+
+    # Plot 1: Total documents
+    plot_bars(ax1, stats_df['total_documents'].values, 
+              'Total Documents', 'Count')
+
+    # Plot 2: Total authors
+    plot_bars(ax2, stats_df['total_authors'].values,
+              'Total Authors', 'Count')
+
+    # Plot 3: Average documents per author
+    plot_bars(ax3, stats_df['avg_docs_per_author'].values,
+              'Avg Documents per Author', 'Documents')
+
+    # Plot 4: Mean document length (with std dev error bars)
+    plot_bars(ax4, stats_df['mean_text_length'].values,
+              'Mean Document Length', 'Words',
+              show_error=True, error_vals=stats_df['std_text_length'].values)
+
+    # Save
+    output_path = os.path.join(stats_dir, "overall_summary_stats.png")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', 
+                facecolor=style.COLORS['bg_white'])
+    plt.close()
+
+    logger.info(f"Saved overall summary plot to {output_path}")
+
 
 def main():
     """Main function to process all category files."""
@@ -221,12 +369,6 @@ def main():
         
         logger.info(f"  Category {category_name} completed successfully!")
     
-    # Save combined dataset
-    """combined_output_file = os.path.join(output_dir, "all_categories_combined_authormix.json")
-    with open(combined_output_file, 'w', encoding='utf-8') as f:
-        json.dump(all_categories_combined, f, ensure_ascii=False, indent=2)
-    logger.info(f"\nSaved combined dataset with {len(all_categories_combined)} documents to {combined_output_file}")
-    """
     # Save summary statistics
     stats_summary_file = os.path.join(stats_dir, "dataset_summary_stats.json")
     logger.info(all_stats)
@@ -241,61 +383,9 @@ def main():
     logger.info(f"Individual category datasets saved to: {output_dir}")
     logger.info(f"Visualizations and stats saved to: {stats_dir}")
     
-    # Create overall summary plot
-    create_overall_summary_plot(all_stats, stats_dir)
+    # Create overall summary plot (top 20 categories)
+    create_overall_summary_plot(all_stats, stats_dir, top_n=20)
 
-def create_overall_summary_plot(all_stats, stats_dir):
-    """Create an overall summary plot across all categories."""
-    
-    if not all_stats:
-        return
-        
-    # Create DataFrame from stats
-    stats_df = pd.DataFrame(all_stats)
-    
-    # Create figure with 3 subplots
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # Plot 1: Total documents per category
-    ax1.bar(stats_df['category'], stats_df['total_documents'], color='lightblue', alpha=0.7)
-    ax1.set_xlabel('Category', fontsize=12)
-    ax1.set_ylabel('Total Documents', fontsize=12)
-    ax1.set_title('Total Documents per Category', fontsize=14, fontweight='bold')
-    ax1.tick_params(axis='x', rotation=45)
-    ax1.grid(axis='y', alpha=0.3)
-    
-    # Plot 2: Total authors per category
-    ax2.bar(stats_df['category'], stats_df['total_authors'], color='lightgreen', alpha=0.7)
-    ax2.set_xlabel('Category', fontsize=12)
-    ax2.set_ylabel('Total Authors', fontsize=12)
-    ax2.set_title('Total Authors per Category', fontsize=14, fontweight='bold')
-    ax2.tick_params(axis='x', rotation=45)
-    ax2.grid(axis='y', alpha=0.3)
-    
-    # Plot 3: Average docs per author by category
-    ax3.bar(stats_df['category'], stats_df['avg_docs_per_author'], color='lightcoral', alpha=0.7)
-    ax3.set_xlabel('Category', fontsize=12)
-    ax3.set_ylabel('Avg Documents per Author', fontsize=12)
-    ax3.set_title('Average Documents per Author by Category', fontsize=14, fontweight='bold')
-    ax3.tick_params(axis='x', rotation=45)
-    ax3.grid(axis='y', alpha=0.3)
-    
-    # Plot 4: Mean text length by category
-    ax4.bar(stats_df['category'], stats_df['mean_text_length'], color='gold', alpha=0.7)
-    ax4.set_xlabel('Category', fontsize=12)
-    ax4.set_ylabel('Mean Text Length (words)', fontsize=12)
-    ax4.set_title('Mean Text Length by Category', fontsize=14, fontweight='bold')
-    ax4.tick_params(axis='x', rotation=45)
-    ax4.grid(axis='y', alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save the overall summary plot
-    summary_plot_path = os.path.join(stats_dir, "overall_summary_stats.png")
-    plt.savefig(summary_plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"Saved overall summary plot to {summary_plot_path}")
 
 if __name__ == "__main__":
     main()

@@ -203,7 +203,8 @@ class ActivationStorage:
             padding_mask=self.padding_mask
         )
         
-        metadata.save(meta_path)
+        # Pass the activation filename (data_path) to save metadata
+        metadata.save(str(data_path))
         
         return data_path, meta_path
     
@@ -238,7 +239,8 @@ class ActivationStorage:
                 )
         
         sp.save_npz(data_path, sparse_matrix)
-        metadata.save(meta_path)
+        # Pass the activation filename (data_path) to save metadata
+        metadata.save(str(data_path))
         
         return data_path, meta_path
 

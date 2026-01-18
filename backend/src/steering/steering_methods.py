@@ -1,9 +1,27 @@
+import logging
 import torch
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
+from enum import Enum
 import numpy as np
-from dataclasses import dataclass
-from typing import Optional, Set, List, Union
+from dataclasses import dataclass, field
+from typing import Optional, List, Union
+
+logger = logging.getLogger(__name__)
+
+
+class SteeringPosition(Enum):
+    """
+    Enum specifying where in the sequence to apply steering.
+    
+    Values:
+        ALL: Apply steering at all token positions
+        AFTER_PROMPT: Apply steering only after the prompt tokens
+        SPECIFIC_RANGE: Apply steering at specific token indices
+    """
+    ALL = "all"
+    AFTER_PROMPT = "after_prompt"
+    SPECIFIC_RANGE = "specific_range"
 
 
 @dataclass
@@ -19,19 +37,56 @@ class SteeringConfig:
     target_confidence: float = 0.8
     num_features: int = 16384
     
-    # CRITICAL: Use relative thresholds, not absolute
-    max_relative_rec_loss: float = 0.3  # 30% increase allowed
-
+    # Early stopping for optimization convergence
+    early_stop_patience: int = 5  # Stop if no improvement for N iterations
+    early_stop_min_delta: float = 1e-6  # Minimum change to count as improvement
+    
+    # Steering position control
+    steering_position: SteeringPosition = SteeringPosition.ALL
+    # For SPECIFIC_RANGE: tuple of (start, end) token indices (inclusive)
+    # For AFTER_PROMPT: automatically determined based on prompt_length
+    position_start: Optional[int] = None
+    position_end: Optional[int] = None
+    
+    # For SAEDiffSteering: pre-computed diff vector
+    sae_diff: Optional[np.ndarray] = None
+    
+    def should_apply_steering(self, token_idx: int, prompt_length: int = 0, seq_len: int = 1) -> bool:
+        """
+        Check if steering should be applied at the given token position.
+        
+        Args:
+            token_idx: Current token index in the sequence (0-indexed absolute position)
+            prompt_length: Length of the prompt in tokens (for AFTER_PROMPT mode)
+            seq_len: Current sequence length being processed (>1 during prompt, 1 during generation)
+            
+        Returns:
+            True if steering should be applied at this position
+        """
+        if self.steering_position == SteeringPosition.ALL:
+            return True
+        elif self.steering_position == SteeringPosition.AFTER_PROMPT:
+            # Apply steering only at the prompt (when processing multiple tokens at once)
+            # seq_len > 1 means we're in the prompt phase, seq_len == 1 means generation
+            return seq_len > 1
+        elif self.steering_position == SteeringPosition.SPECIFIC_RANGE:
+            start = self.position_start or 0
+            end = self.position_end or float('inf')
+            return start <= token_idx <= end
+        return True
 
 
 class SteeringMechanism(ABC):
     """Abstract base class for steering mechanisms."""
     
-    def __init__(self, config: SteeringConfig, classifier_weights: np.ndarray):
+    def __init__(self, config: SteeringConfig, classifier_weights: np.ndarray, classifier_intercept: float = 0.0):
         self.config = config
         # Map classifier weights (in local order) to full feature space (in global order)
         self.w = self._map_weights_to_full_space(classifier_weights)
         self.mask = self._create_mask()
+        # Store classifier intercept (bias term) - CRITICAL for correct probability
+        self.intercept = classifier_intercept
+        logger.info(f"SteeringMechanism initialized with intercept: {self.intercept}")
     
     def _map_weights_to_full_space(self, classifier_weights: np.ndarray) -> torch.Tensor:
         """
@@ -105,9 +160,7 @@ class SteeringMechanism(ABC):
                 - For ProjectedGradientSteering: decoder, original_reconstruction
         
         Returns:
-            delta_x: Steering vector with same shape as x [batch, seq_len, sae_dim]
-                    This vector is ADDED to x to produce steered features:
-                    x_steered = x + delta_x
+            steered_activations: Steered activations with same shape as x [batch, seq_len, sae_dim]
         
         The method is called during generation via a hook that:
         1. Intercepts activations at the target layer
@@ -136,40 +189,51 @@ class HeuristicSteering(SteeringMechanism):
             x: Current SAE activations [batch, seq_len, sae_dim]
             auto_tune: Whether to automatically tune alpha
             decoder: (optional) SAE decoder for quality checking
-            original_reconstruction: (optional) Original decoded activations
+            original_activations: (optional) Original activations (before SAE encoding)
             history_feats: (optional) History of SAE features from all previous tokens [batch, n_tokens, sae_dim]: list of tensors
             
         Returns:
-            Steering vector delta_x
+            Steered activations (original_activations + delta from steering)
         """
         device = x.device
         # Both mask and w are now full-size (num_features,), so element-wise multiply works
         w_s = (self.mask * self.w).to(device)
-
         
         # Normalize by L2 norm
         w_s_norm = torch.norm(w_s)
         if w_s_norm < 1e-8:
-            return torch.zeros_like(x)
+            # No steering possible, return original activations if available
+            original_activations = kwargs.get('original_activations')
+            if original_activations is not None:
+                return original_activations
+            else:
+                raise ValueError("original_activations must be provided")
         
         normalized_steering = w_s / w_s_norm
         
         # Scale by alpha
         alpha = self.config.alpha
         if auto_tune:
-            alpha = self._tune_alpha(starting_alpha=alpha, x=x, normalized_steering=normalized_steering, **kwargs)
-        # Broadcast to match input shape
-        delta_x = alpha * normalized_steering
-        # Expand dimensions to match [batch, seq_len, sae_dim]
-        while delta_x.ndim < x.ndim:
-            delta_x = delta_x.unsqueeze(0)
-        
-        # Ensure delta_x can broadcast to x's shape
-        # If x is [batch, seq_len, sae_dim] and delta_x is [1, 1, sae_dim], expand it
-        if delta_x.shape != x.shape:
-            delta_x = delta_x.expand_as(x)
+            final_alpha, steered_activations = self._tune_alpha(
+                starting_alpha=alpha, x=x, normalized_steering=normalized_steering, **kwargs
+            )
+        else:
+            # Apply fixed alpha steering
+            delta_x = self.compute_steering_with_alpha(x, alpha, **kwargs)
+            decoder = kwargs.get('decoder')
+            original_activations = kwargs.get('original_activations')
             
-        return delta_x
+            if decoder is not None and original_activations is not None:
+                steered_x = x + delta_x
+                delta_activations = decoder(steered_x) - decoder(x)
+                steered_activations = original_activations + delta_activations
+            else:
+                # Fallback: return delta_x directly (less accurate)
+                steered_activations = x + delta_x
+                if decoder is not None:
+                    steered_activations = decoder(steered_activations)
+            
+        return steered_activations
 
     def compute_steering_with_alpha(
         self, 
@@ -193,7 +257,6 @@ class HeuristicSteering(SteeringMechanism):
         device = x.device
         # Both mask and w are now full-size (num_features,), so element-wise multiply works
         w_s = (self.mask * self.w).to(device)
-
         
         # Normalize by L2 norm
         w_s_norm = torch.norm(w_s)
@@ -224,12 +287,23 @@ class HeuristicSteering(SteeringMechanism):
         For document-level aggregated confidence matching training, use 
         confidence_achieved_aggregated() instead.
         """
-        confidence = torch.sigmoid((x_vector * self.w.to(x_vector.device)).sum(dim=-1).mean())
-        print(f"Confidence: {confidence}")
+        logit = (x_vector * self.w.to(x_vector.device)).sum(dim=-1).mean() + self.intercept
+        confidence = torch.sigmoid(logit)
+        logger.debug(f"Confidence: {confidence} (logit: {logit}, intercept: {self.intercept})")
         if confidence > self.config.target_confidence:
-            print(f"Breaking due to confidence")
+            logger.debug(f"Breaking due to confidence: {confidence}")
             return True
         return False
+
+    def calculate_confidence(self, x_vector: torch.Tensor) -> float:
+        """
+        Calculate confidence on current token(s).
+        
+        """
+        logit = (x_vector * self.w.to(x_vector.device)).sum(dim=-1).mean() + self.intercept
+        confidence = torch.sigmoid(logit)
+        
+        return confidence
 
     def confidence_achieved_aggregated(self, x_vector: torch.Tensor, threshold: float = 0.7, skip_prompt_tokens: int = 0) -> bool:
         """
@@ -265,16 +339,16 @@ class HeuristicSteering(SteeringMechanism):
         else:
             x_aggregated = x_vector.mean(dim=1)  # [batch, sae_dim]
         
-        # Compute confidence: dot product with weights, then sigmoid
+        # Compute confidence: dot product with weights + intercept, then sigmoid
         w = self.w.to(x_aggregated.device)
         # x_aggregated: [batch, sae_dim], w: [sae_dim]
-        # Sum over feature dimension, then average over batch
-        logit = (x_aggregated * w).sum(dim=-1).mean()
+        # Sum over feature dimension, then average over batch, then add intercept
+        logit = (x_aggregated * w).sum(dim=-1).mean() + self.intercept
         confidence = torch.sigmoid(logit)
         
-        print(f"Aggregated confidence: {confidence.item():.4f} (threshold: {threshold}, n_tokens: {x_vector.shape[1] - skip_prompt_tokens})")
+        logger.debug(f"Aggregated confidence: {confidence.item():.4f} (threshold: {threshold}, n_tokens: {x_vector.shape[1] - skip_prompt_tokens})")
         if confidence >= threshold:
-            print(f"Breaking alpha tuning due to aggregated confidence >= {threshold}")
+            logger.debug(f"Breaking alpha tuning due to aggregated confidence >= {threshold}")
             return True
         return False
 
@@ -289,7 +363,7 @@ class HeuristicSteering(SteeringMechanism):
         original_activations=None,  # Fixed: proper terminology
         history_feats=None,  # History of SAE features from all previous tokens
         **kwargs
-    ) -> float:
+    ) -> tuple[float, torch.Tensor]:
         """
         Tune alpha using line search.
         Start at 0.01, multiply by 2 until quality degrades.
@@ -302,68 +376,29 @@ class HeuristicSteering(SteeringMechanism):
             history_feats: History of SAE features from all previous tokens [batch, n_tokens, sae_dim]: list of tensors
         """
         alpha = starting_alpha
-        best_alpha = alpha
+        final_alpha = alpha
 
         if self.confidence_achieved(x):
-            return 0
+            if history_feats is not None:
+                history_feats.append(x.detach().clone())
+            return 0, original_activations
         
         for _ in range(10):  # Max 10 iterations
+
             test_steering = alpha * normalized_steering
             
             # Expand dimensions
-            print(f"Test steering shape pre: {test_steering.shape}")
-            while test_steering.ndim < x.ndim:
-                test_steering = test_steering.unsqueeze(0)
+            while test_steering.ndim < x.ndim: 
+                test_steering = test_steering.unsqueeze(0) # from torch.Size([16384]) to torch.Size([1, 1, 16384])
 
-            print(f"Test steering shape post: {test_steering.shape}")
-
-            print(f"Test steering:")
-            for i, value in enumerate(test_steering.squeeze()):
-                if value != 0:
-                    print(f"  Index {i}: {value}")
-            x_steered = x + test_steering
+            steered_x = x + test_steering
             
-            # Check if quality is acceptable by comparing reconstructed activations
-            if decoder is not None and original_activations is not None:
-                # Decode steered features back to activation space
-                steered_reconstruction = decoder(x_steered)
-                original_reconstruction = decoder(x)
+            delta_activations = decoder(steered_x) - decoder(x)
 
-                print(f"Steered reconstruction shape: {steered_reconstruction.shape}")  
-                print(f"Original activations shape: {original_activations.shape}")
-                
-                # Check if shapes match
-                if steered_reconstruction.shape != original_activations.shape:
-                    print(f"ERROR: Shape mismatch! Cannot compute MSE loss.")
-                    print(f"  Steered: {steered_reconstruction.shape}")
-                    print(f"  Original: {original_activations.shape}")
-                    # Try to handle shape mismatch by reshaping or skipping
-                    break
-                
-                # Compare in activation space (NOT token space!)
-                # This measures how much steering distorted the internal representations
-                rec_loss_steered = F.mse_loss(steered_reconstruction, original_activations)
-                rec_loss_original = F.mse_loss(original_reconstruction, original_activations)
-                rec_loss_value_steered = rec_loss_steered.item()  # Convert tensor to float
-                rec_loss_value_original = rec_loss_original.item()  # Convert tensor to float
-
-                # Calculate euclidian distance between steered and original reconstruction
-                euclidian_distance = torch.norm(steered_reconstruction - original_activations)
-                print(f"Euclidian distance: {euclidian_distance}")
-
-                # Calculate cosine similarity between steered and original reconstruction
-                cosine_similarity = torch.nn.functional.cosine_similarity(steered_reconstruction, original_activations, dim=-1)
-                print(f"Cosine similarity: {cosine_similarity}")
-
-                
-                relative_increase = (rec_loss_value_steered/rec_loss_value_original) - 1.0
-                print(f"Relative increase in MSEs between reconstruction losses: {relative_increase} (calculated as {rec_loss_value_steered}/{rec_loss_value_original} - 1.0)")
-                if relative_increase > self.config.max_relative_rec_loss:
-                    print(f"Breaking due to relative increase (threshold: {self.config.max_relative_rec_loss})")
-                    break
+            steered_activations = original_activations + delta_activations
             
-            best_alpha = alpha
-            print(f"Best alpha: {best_alpha}")
+            final_alpha = alpha
+            logger.debug(f"Final alpha: {final_alpha}")
             
             # Check classifier confidence on aggregated activations
             # The classifier was trained on document-level aggregated data, so we should
@@ -372,52 +407,102 @@ class HeuristicSteering(SteeringMechanism):
             if history_feats is not None and len(history_feats) > 1:
                 # Skip first element (last prompt token) to match training which uses from_token=10
                 generated_feats = history_feats[1:]  # Only generated tokens
-                history_feats_tensor = torch.stack(generated_feats, dim=1)
-                
-                # Check confidence on aggregated (averaged) activations
+                history_feats_tensor = torch.stack(generated_feats + [steered_x.detach().clone()], dim=1)
+
                 if self.confidence_achieved_aggregated(history_feats_tensor, threshold=0.7, skip_prompt_tokens=1):
+                    history_feats.append(steered_x.detach().clone())
                     break
-           
-            
-            alpha *= 1.5
             
             # Also check per-token confidence (heuristic check, not matching training)
             # For aggregated confidence matching training, see confidence_achieved_aggregated above
-            if self.confidence_achieved(x_steered):
+            if self.confidence_achieved(steered_x):
+                if history_feats is not None:
+                    history_feats.append(steered_x.detach().clone())
                 break
+
+            alpha *= 1.5
             
                 
-        return best_alpha
+        return final_alpha, steered_activations
 
 
 class ProjectedGradientSteering(SteeringMechanism):
-    """Projected gradient ascent steering with reconstruction loss."""
+    """
+    Projected gradient ascent steering with reconstruction loss.
+    
+    This steering method optimizes a perturbation delta_x in SAE feature space
+    to maximize classifier confidence while minimizing reconstruction loss.
+    
+    IMPORTANT: This method requires full gradient support during generation.
+    Use with manual_generate() in steered_text_generation.py, NOT with 
+    model.generate() which wraps generation in torch.no_grad().
+    
+    Gradient flow:
+    - delta_x is a leaf tensor with requires_grad=True
+    - Optimization: loss.backward() computes gradients for delta_x
+    - Model weights and SAE weights are NOT updated (only delta_x is optimized)
+    - decoder() must allow gradients through for reconstruction loss computation
+    """
     
     def compute_steering(
         self,
         x: torch.Tensor,
         decoder,
-        original_reconstruction: torch.Tensor,
         return_history: bool = False,
         **kwargs
     ) -> torch.Tensor:
         """
         Optimize steering via projected gradient ascent.
         
+        This method runs a local optimization loop to find the best perturbation
+        delta_x that maximizes classifier confidence while preserving reconstruction
+        quality. Gradients flow through the decoder for the reconstruction loss.
+        
         Args:
             x: Current SAE activations [batch, seq_len, sae_dim]
-            decoder: SAE decoder function
-            original_reconstruction: Original decoded output for comparison
+            decoder: SAE decoder function (must support gradient computation)
+            original_reconstruction: Original decoded output for comparison (no gradients)
             return_history: Whether to return optimization history
             
         Returns:
-            Optimized steering vector delta_x (and optionally history)
+            Steered activations (decoded from x + optimized delta_x)
         """
         device = x.device
         w = self.w.to(device)
         mask = self.mask.to(device)
+
+        original_activations = kwargs.get('original_activations')
         
-        # Initialize delta_x
+        # CRITICAL: Ensure gradients are enabled for the optimization loop
+        # This is required for loss.backward() to compute gradients for delta_x
+        # Note: The hook should wrap this call in torch.enable_grad() context
+        if not torch.is_grad_enabled():
+            raise RuntimeError(
+                "ProjectedGradientSteering requires gradients to be enabled. "
+                "The hook should wrap this call in torch.enable_grad() context."
+            )
+        
+        logger.info(
+            f"[ProjectedGradientSteering] Starting compute_steering with "
+            f"batch_shape={tuple(x.shape)}, lr={self.config.learning_rate}, "
+            f"max_iters={self.config.max_iterations}, "
+            f"target_confidence={self.config.target_confidence}"
+        )
+        
+        # Detach x to ensure we don't backprop through the model
+        # We only need gradients for delta_x optimization
+        x = x.detach()
+        
+        # PRE-COMPUTE: Cache decoder(x) once since x never changes
+        # This avoids redundant decoder calls later
+        with torch.no_grad():
+            decoder_x_cached = decoder(x)
+        
+        # PRE-COMPUTE: Expand mask once instead of per-iteration
+        mask_expanded = mask.unsqueeze(0).unsqueeze(0)
+        
+        # Initialize delta_x as a leaf tensor with gradients enabled
+        # This is the only tensor being optimized - model/SAE weights are frozen
         delta_x = torch.zeros_like(x, requires_grad=True)
         
         optimizer = torch.optim.Adam([delta_x], lr=self.config.learning_rate)
@@ -427,62 +512,239 @@ class ProjectedGradientSteering(SteeringMechanism):
             'classifier_logit': [],
             'rec_loss': [],
             'norm_penalty': []
-        }
+        } if return_history else None
+        
+        final_classifier_prob = None
+        iterations_run = 0
+        
+        # Early stopping tracking
+        best_loss = float('inf')
+        no_improvement_count = 0
         
         for iteration in range(self.config.max_iterations):
             optimizer.zero_grad()
             
-            # Apply mask to delta_x
-            masked_delta = delta_x * mask.unsqueeze(0).unsqueeze(0)
+            # Apply mask to delta_x (use pre-computed expanded mask)
+            masked_delta = delta_x * mask_expanded
             x_steered = x + masked_delta
             
-            # Compute classifier logit (dot product with weights)
+            # Compute classifier logit (dot product with weights + intercept)
             # IMPORTANT: Aggregate features first (matching training approach)
-            # Training aggregates features over tokens before computing logit
             # x_steered shape: [batch, seq_len, sae_dim] -> [batch, sae_dim]
             x_aggregated = x_steered.mean(dim=1)
-            # Then compute logit on aggregated features
-            z1 = (x_aggregated * w).sum(dim=-1).mean()
+            # Then compute logit on aggregated features (don't forget intercept!)
+            z1 = (x_aggregated * w).sum(dim=-1).mean() + self.intercept
             
             # Compute reconstruction loss
             # Compares decoded ACTIVATIONS, not tokens!
-            # This measures distortion in the activation space at layer 15
             reconstructed = decoder(x_steered)
-            rec_loss = F.mse_loss(reconstructed, original_reconstruction)
+            rec_loss = F.mse_loss(reconstructed, original_activations)
             
-            # Norm penalty
-            norm_penalty = torch.norm(masked_delta) ** 2
+            # Norm penalty (use sum instead of norm squared for slightly faster compute)
+            norm_penalty = (masked_delta ** 2).sum()
             
             # Total loss to maximize (we'll negate for minimization)
             loss = -(z1 - self.config.lambda_rec * rec_loss - 
                     self.config.mu_norm * norm_penalty)
+
+            # Extract scalar values before backward (avoids repeated .item() calls)
+            current_loss = loss.item()
+            z1_val = z1.item()
+            rec_loss_val = rec_loss.item()
+            norm_penalty_val = norm_penalty.item()
+            classifier_prob_val = torch.sigmoid(z1).item()
+            
+            final_classifier_prob = classifier_prob_val
+            iterations_run = iteration + 1
+            
+            logger.debug(
+                f"[ProjectedGradientSteering][iter {iteration}] "
+                f"logit={z1_val:.4f}, prob={classifier_prob_val:.4f}, "
+                f"rec_loss={rec_loss_val:.6f}, "
+                f"norm_penalty={norm_penalty_val:.6f}, "
+                f"loss={current_loss:.6f}"
+            )
             
             loss.backward()
             optimizer.step()
             
-            # Project back to mask
+            # Project back to mask (use pre-computed expanded mask)
             with torch.no_grad():
-                delta_x.mul_(mask.unsqueeze(0).unsqueeze(0))
+                delta_x.data.mul_(mask_expanded)
             
-            # Store history
-            if return_history:
-                history['loss'].append(loss.item())
-                history['classifier_logit'].append(z1.item())
-                history['rec_loss'].append(rec_loss.item())
-                history['norm_penalty'].append(norm_penalty.item())
+            # Store history if needed
+            if history is not None:
+                history['loss'].append(current_loss)
+                history['classifier_logit'].append(z1_val)
+                history['rec_loss'].append(rec_loss_val)
+                history['norm_penalty'].append(norm_penalty_val)
             
-            # Stopping criteria
-            with torch.no_grad():
-                classifier_prob = torch.sigmoid(z1)
-                if classifier_prob > self.config.target_confidence:
+            # Early stopping check: loss convergence
+            loss_improvement = best_loss - current_loss
+            if loss_improvement > self.config.early_stop_min_delta:
+                best_loss = current_loss
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+                if no_improvement_count >= self.config.early_stop_patience:
+                    logger.info(
+                        f"[ProjectedGradientSteering] Early stopping at iter {iteration}: "
+                        f"no improvement for {no_improvement_count} iterations"
+                    )
                     break
-                
-                # Check relative reconstruction loss
-                if self.config.should_stop_steering(rec_loss.item()):
-                    break
+            
+            # Stopping criteria: confidence threshold
+            if classifier_prob_val > self.config.target_confidence:
+                logger.info(
+                    f"[ProjectedGradientSteering] Stopping at iter {iteration} "
+                    f"because prob {classifier_prob_val:.4f} "
+                    f"exceeded target {self.config.target_confidence:.4f}"
+                )
+                if iteration == 0:
+                    if return_history:
+                        return original_activations, history
+                    return original_activations
+                break
         
-        result = delta_x.detach() * mask.unsqueeze(0).unsqueeze(0)
+        # Compute final steered activations using cached decoder(x)
+        with torch.no_grad():
+            final_delta = delta_x.detach() * mask_expanded
+            final_x_steered = x + final_delta
+            steered_activations = decoder(final_x_steered)
+            
+            # Use cached decoder(x) instead of calling decoder again
+            delta_activations = steered_activations - decoder_x_cached
+            steered_activations_clean = original_activations + delta_activations
+        
+        logger.info(
+            f"[ProjectedGradientSteering] Finished compute_steering with "
+            f"final_prob={final_classifier_prob if final_classifier_prob is not None else float('nan'):.4f}, "
+            f"total_iters={iterations_run}, "
+            f"final_loss={current_loss:.4f}"
+            f"final_rec_loss={rec_loss_val:.4f}"
+            f"final_norm_penalty={norm_penalty_val:.4f}"
+    )
         
         if return_history:
-            return result, history
-        return result
+            return steered_activations_clean, history
+
+        return steered_activations_clean
+
+
+class SAEDiffSteering:
+    """
+    SAE-diff-based steering that adds pre-computed feature diffs to activations.
+    
+    Unlike other steering methods that use classifier weights, this method uses
+    the difference between SAE features of original texts and baseline-generated texts.
+    This represents the direction from baseline style to the target author's style.
+    
+    The diff is typically computed as: diff = mean(original_features) - mean(baseline_features)
+    and is loaded from pre-computed files.
+    
+    This method does NOT require classifier weights, only the pre-computed diff vector.
+    """
+    
+    def __init__(self, config: SteeringConfig):
+        """
+        Initialize SAEDiffSteering.
+        
+        Args:
+            config: SteeringConfig containing the sae_diff vector
+                   The sae_diff should be a numpy array of shape (num_features,)
+        """
+        self.config = config
+        
+        if config.sae_diff is None:
+            raise ValueError("SAEDiffSteering requires sae_diff to be set in config")
+        
+        # Convert diff to tensor
+        self.diff = torch.from_numpy(config.sae_diff).float()
+        
+        logger.info(f"SAEDiffSteering initialized with diff L2 norm: {torch.norm(self.diff):.4f}")
+    
+    def compute_steering(
+        self,
+        x: torch.Tensor,
+        decoder,
+        original_activations: torch.Tensor,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Apply SAE-diff steering to the given activations.
+        
+        The diff is scaled by alpha and added to SAE features, then decoded back
+        to activation space. 
+        
+        Note: Position-based steering (AFTER_PROMPT, SPECIFIC_RANGE) is handled
+        in the hook before calling this method. When this method is called,
+        steering should be applied to all positions in x.
+        
+        Args:
+            x: Current SAE feature activations [batch, seq_len, sae_dim]
+               During autoregressive generation, seq_len is typically 1
+            decoder: SAE decoder function to convert features back to activations
+            original_activations: Original activations (before SAE encoding)
+            prompt_length: Number of prompt tokens (unused here, position check done in hook)
+            
+        Returns:
+            Steered activations with same shape as original_activations
+        """
+        device = x.device
+        batch_size, seq_len, sae_dim = x.shape
+        
+        # Move diff to device
+        diff = self.diff.to(device)
+        
+        # Scale diff by alpha (steering strength)
+        alpha = self.config.alpha
+        scaled_diff = alpha * diff
+        
+        # Expand diff to match x shape [batch, seq_len, sae_dim]
+        # diff: [sae_dim] -> [1, 1, sae_dim] -> [batch, seq_len, sae_dim]
+        delta_x = scaled_diff.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, sae_dim)
+        
+        # Add delta to SAE features
+        steered_x = x + delta_x
+        
+        # Compute steering in activation space
+        # delta_activations = decoder(steered_x) - decoder(x)
+        # steered_activations = original_activations + delta_activations
+        delta_activations = decoder(steered_x) - decoder(x)
+
+        steered_activations = original_activations + delta_activations
+        
+        # Log steering magnitude for verification
+        delta_norm = torch.norm(delta_activations).item()
+        logger.info(f"SAEDiff steering applied: alpha={alpha:.4f}, delta_norm={delta_norm:.4f}")
+
+        return steered_activations
+    
+    def compute_steering_delta(
+        self,
+        seq_len: int,
+        device: torch.device = None
+    ) -> torch.Tensor:
+        """
+        Compute the steering delta in SAE feature space.
+        
+        Useful for pre-computing the delta before decoding.
+        
+        Args:
+            seq_len: Sequence length
+            device: Target device
+            
+        Returns:
+            Delta tensor of shape [1, seq_len, sae_dim]
+        """
+        if device is None:
+            device = self.diff.device
+        
+        diff = self.diff.to(device)
+        
+        # Scale by alpha and expand
+        alpha = self.config.alpha
+        scaled_diff = alpha * diff
+        delta_x = scaled_diff.unsqueeze(0).unsqueeze(0).expand(1, seq_len, -1)
+        
+        return delta_x

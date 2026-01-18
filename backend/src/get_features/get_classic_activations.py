@@ -178,7 +178,8 @@ class ActivationStorage:
             padding_mask=self.padding_mask
         )
         #np.savez(data_path, self.activations)
-        metadata.save(meta_path)
+        # Pass the activation filename (data_path) to save metadata
+        metadata.save(str(data_path))
         
         return data_path, meta_path
     
@@ -638,8 +639,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="google/gemma-2-2b",
-        choices=["google/gemma-2-2b", "google/gemma-2-9b"],
+        default="google/gemma-2-9b-it",
+        choices=["google/gemma-2-2b", "google/gemma-2-9b", "google/gemma-2-9b-it"],
         help="Model to use for feature extraction"
     )
     
@@ -680,7 +681,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min_length_doc",
         type=int,
-        default=35,
+        default=None,
         help="Minimum document length"
     )
     parser.add_argument(
@@ -716,7 +717,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run_name",
         type=str,
-        default="politics_500",
+        default="classic_activations_news_politics_cleaned",
         help="Name of the run to create a folder in outputs"
     )
 

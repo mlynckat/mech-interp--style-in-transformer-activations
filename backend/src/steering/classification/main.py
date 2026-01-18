@@ -1,7 +1,28 @@
 # main.py
 """
-Main execution script for ML pipeline
-Run multiple experiments with different transformers and models
+Main execution script for ML classification pipeline.
+
+This module trains author classification models and saves them with a 
+ClassifierTrainingConfig for seamless integration with the classification pipeline.
+
+Usage:
+    # Train with default settings
+    python main.py --run-name my_experiment
+    
+    # Train ModernBERT for 10 epochs on all data
+    python main.py --run-name modernbert_10epochs --transformers modern_bert --models modern_bert --data-subset all
+    
+    # Train on one-author subset
+    python main.py --run-name modernbert_one_author --data-subset one_author
+
+Integration with classify_generated.py:
+    # After training, use the trained models for classification:
+    from backend.src.steering.classification.classify_generated import run_classification_from_configs
+    
+    results = run_classification_from_configs(
+        generation_run_dir="data/steering/tests/my_generation_run",
+        classifier_run_name="my_experiment"
+    )
 """
 
 import json
@@ -18,11 +39,25 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from backend.src.steering.classification.read_data import DataReader
-from backend.src.steering.classification.data_transformers import TFIDFTransformer, SentenceEmbeddingTransformer, ModernBertTransformer
-from backend.src.steering.classification.classification_models import LogisticRegressionModel, RandomForestModel, SGDClassifierModel, ModernBertClassifierModel
+from backend.src.steering.classification.data_transformers import (
+    TFIDFTransformer, 
+    SentenceEmbeddingTransformer, 
+    ModernBertTransformer
+)
+from backend.src.steering.classification.classification_models import (
+    LogisticRegressionModel, 
+    RandomForestModel, 
+    SGDClassifierModel, 
+    ModernBertClassifierModel
+)
 from backend.src.steering.classification.pipeline import MLPipeline
+from backend.src.steering.run_config import ClassifierTrainingConfig, DEFAULT_AUTHORS
 
-# Configuration: Map string names to classes
+
+# ============================================================================
+# CONFIGURATION MAPPINGS
+# ============================================================================
+
 AVAILABLE_TRANSFORMERS = {
     "tfidf": TFIDFTransformer,
     "sentence_embedding": SentenceEmbeddingTransformer,
@@ -44,16 +79,35 @@ VALID_COMBINATIONS = {
 }
 
 
+# ============================================================================
+# RESULT SAVING UTILITIES
+# ============================================================================
 
-def save_results(base_dir: Path, results: Dict[str, Any], suffix: str = None):
-    """Save results to JSON file and create aggregated results dataframe test results"""
+def save_results(
+    results_dir: Path, 
+    results: Dict[str, Any], 
+    config: ClassifierTrainingConfig
+) -> Path:
+    """
+    Save training results to JSON file and create aggregated results dataframe.
+    
+    Args:
+        results_dir: Directory to save results
+        results: Dictionary of results per transformer/model/author
+        config: Training configuration
+        
+    Returns:
+        Path to saved results file
+    """
     datetime_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    filepath = base_dir / f"results_{datetime_suffix}_{suffix}.json"
+    # Save raw results
+    filepath = results_dir / f"results_{datetime_suffix}_{config.run_name}.json"
     with open(filepath, 'w') as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Results saved to: {filepath}")
 
+    # Create aggregated results dataframe
     aggregated_results = {
         "value": [],
         "score": [],
@@ -74,230 +128,293 @@ def save_results(base_dir: Path, results: Dict[str, Any], suffix: str = None):
                     aggregated_results["author"].append(author)
 
     results_df = pd.DataFrame(aggregated_results)
-    results_df.to_csv(base_dir / f"results_aggregated_{datetime_suffix}_{suffix}.csv", index=False)
+    csv_path = results_dir / f"results_aggregated_{datetime_suffix}_{config.run_name}.csv"
+    results_df.to_csv(csv_path, index=False)
+    print(f"Aggregated results saved to: {csv_path}")
+    
+    return filepath
 
 
-def get_confusion_matrix(predicted_labels: list, true_labels: list):
-    """Get confusion matrix"""
-
+def get_confusion_matrix(predicted_labels: list, true_labels: list) -> pd.DataFrame:
+    """
+    Create confusion matrix as DataFrame.
+    
+    Args:
+        predicted_labels: List of predicted labels
+        true_labels: List of true labels
+        
+    Returns:
+        DataFrame with confusion matrix
+    """
     true_labels_unique = list(set(true_labels))
     predicted_labels_unique = list(set(predicted_labels))
 
     df_conf_matrix = pd.DataFrame(0, index=true_labels_unique, columns=predicted_labels_unique)
-    print(df_conf_matrix)
+    
     for i in range(len(true_labels)):
         df_conf_matrix.loc[true_labels[i], predicted_labels[i]] += 1  
 
+    print(f"Confusion matrix: {df_conf_matrix}")
     return df_conf_matrix
 
 
+# ============================================================================
+# TRAINING FUNCTIONS
+# ============================================================================
+
 def run_single_experiment(
-    path_to_models: Path,
-    path_to_results: Path,
+    config: ClassifierTrainingConfig,
     data_transformer_class,
     classification_model_class,
     data_transformer_params: dict = None,
     classification_model_params: dict = None,
-    test_size: float = 0.2,
-    random_state: int = 42
-):
-    """Run a single pipeline experiment"""
-
+) -> Dict[str, Any]:
+    """
+    Run a single training experiment for all authors.
+    
+    Args:
+        config: Training configuration
+        data_transformer_class: Data transformer class to use
+        classification_model_class: Classification model class to use
+        data_transformer_params: Optional transformer parameters
+        classification_model_params: Optional model parameters
+        
+    Returns:
+        Dictionary of results per author
+    """
     results = {}
     
     # 1. Read data
     X, y = DataReader.read_news_json_data()
+    
+    if config.data_subset == "all":
+        print(f"Data shape: X: {X.shape}, y: {y.shape}")
+        print(f"Data unique authors: {y.unique()}")
+        print(f"Data author distribution: {y.value_counts()}")
 
-    print(f"Data shape: X: {X.shape}, y: {y.shape}")
-    print(f"Data unique authors: {y.unique()}")
-    print(f"Data author distribution: {y.value_counts()}")
-
-    X_train, X_test, y_train, y_test = train_test_split(
+        X_train, X_test, y_train, y_test = train_test_split(
             X,
             y,
-            test_size=test_size,
-            random_state=random_state,
+            test_size=config.test_size,
+            random_state=config.random_state,
             stratify=y,
         )
+    
+    elif config.data_subset == "one_author":
+        X_train, X_test, y_train, y_test = DataReader.read_news_generated_data()
+        print(f"Data shape: X_train: {X_train.shape}, y_train: {y_train.shape}")
+        print(f"Data shape: X_test: {X_test.shape}, y_test: {y_test.shape}")
+        print(f"Data unique authors: {y_train.unique()}")
+        print(f"Data author distribution: {y_train.value_counts()}")
+    else:
+        raise ValueError(f"Data subset {config.data_subset} is not supported.")
 
-    # Transform y to binary classification
+    # Train binary classifier for each author
     for author in y.unique():
+        print(f"\n{'='*60}")
+        print(f"Training classifier for author: {author}")
+        print(f"{'='*60}")
 
-        y_train_author = (y_train == author).astype(int)
-        y_test_author = (y_test == author).astype(int)
+        if config.data_subset == "all":
+            X_train_subset = X_train
+            X_test_subset = X_test
+            y_train_subset = y_train
+            y_test_subset = y_test
+            y_train_author_subset = (y_train_subset == author).astype(int)
+            y_test_author_subset = (y_test_subset == author).astype(int)
+        elif config.data_subset == "one_author":
+            author_mask_train = (y_train == author) | (y_train == f"{author} generated")
+            author_mask_test = (y_test == author) | (y_test == f"{author} generated")
+            X_train_subset = X_train[author_mask_train]
+            X_test_subset = X_test[author_mask_test]
+            y_train_subset = y_train[author_mask_train]
+            y_test_subset = y_test[author_mask_test]
+            y_train_author_subset = (y_train_subset == author).astype(int)
+            y_test_author_subset = (y_test_subset == author).astype(int)
 
-        print(f"Train data shape: X_train: {X_train.shape}, y_train: {y_train.shape}")
-        print(f"Test data shape: X_test: {X_test.shape}, y_test: {y_test.shape}")
-        print(f"Train data author distribution: {y_train_author.value_counts()}")
-        print(f"Test data author distribution: {y_test_author.value_counts()}")
+        print(f"Train data shape: X_train: {X_train_subset.shape}, y_train: {y_train_subset.shape}")
+        print(f"Test data shape: X_test: {X_test_subset.shape}, y_test: {y_test_subset.shape}")
+        print(f"Train data author distribution: {y_train_author_subset.value_counts()}")
+        print(f"Test data author distribution: {y_test_author_subset.value_counts()}")
 
         results[author] = {}
 
         # 2. Initialize data transformation and model
-        data_transformer = data_transformer_class(path_to_models=path_to_models, author=author, **(data_transformer_params or {}))
-        classification_model = classification_model_class(path_to_models=path_to_models, author=author, data_transformer=data_transformer, **(classification_model_params or {}))
+        data_transformer = data_transformer_class(
+            path_to_models=config.models_dir, 
+            author=author, 
+            **(data_transformer_params or {})
+        )
+        classification_model = classification_model_class(
+            path_to_models=config.models_dir, 
+            author=author, 
+            data_transformer=data_transformer, 
+            **(classification_model_params or {})
+        )
 
         # 3. Create and run pipeline
         pipeline = MLPipeline(data_transformer, classification_model)
-        results_per_author = pipeline.run(X_train, y_train_author, X_test, y_test_author)
+        results_per_author = pipeline.run(
+            X_train_subset, 
+            y_train_author_subset, 
+            X_test_subset, 
+            y_test_author_subset
+        )
 
+        # 4. Create and save confusion matrix
         predicted_labels = results_per_author["predicted_labels"].map({1: author, 0: "other"}).values.tolist()
-
-        confusion_matrix = get_confusion_matrix(predicted_labels, y_test.values.tolist())
-        sns.heatmap(confusion_matrix, annot=True, fmt='d')
-        plt.title(f"Confusion Matrix for {author} {data_transformer_class.__name__} {classification_model_class.__name__}")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
+        conf_matrix = get_confusion_matrix(predicted_labels, y_test_subset.values.tolist())
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.heatmap(conf_matrix, annot=True, fmt='d', ax=ax)
+        ax.set_title(f"Confusion Matrix for {author}\n{data_transformer_class.__name__} + {classification_model_class.__name__}")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
         plt.xticks(rotation=45)
-        plt.savefig(path_to_results / f"confusion_matrix_{author}_{data_transformer_class.__name__}_{classification_model_class.__name__}.png")
         plt.tight_layout()
-        plt.close()
+        
+        cm_path = config.results_dir / f"confusion_matrix_{author}_{config.run_name}.png"
+        fig.savefig(cm_path)
+        plt.close(fig)
+        print(f"Saved confusion matrix to: {cm_path}")
 
         results[author].update(results_per_author)
       
     return results
 
 
-def run_experiments(
-    transformers: Optional[List[str]] = None,
-    models: Optional[List[str]] = None,
-    test_size: float = 0.2,
-    random_state: int = 42,
-    data_transformer_params: Optional[Dict[str, Dict[str, Any]]] = None,
-    classification_model_params: Optional[Dict[str, Dict[str, Any]]] = None,
-    suffix: Optional[str] = None
-):
+def run_training(config: ClassifierTrainingConfig) -> Dict[str, Any]:
     """
-    Run multiple experiments with different configurations
+    Run classifier training with the given configuration.
+    
+    This is the main entry point for training classifiers.
     
     Args:
-        transformers: List of transformer names to use. If None, uses all valid combinations.
-        models: List of model names to use. If None, uses all valid combinations.
-        test_size: Proportion of data to use for testing
-        random_state: Random seed for reproducibility
-        data_transformer_params: Dict mapping transformer names to their parameter dicts
-        classification_model_params: Dict mapping model names to their parameter dicts
-        suffix: Optional suffix for result files
+        config: ClassifierTrainingConfig with all training settings
+        
+    Returns:
+        Dictionary of training results
     """
-    # Create base directory for results in the current directory
-    results_dir = Path(__file__).parent / "results"
-    models_dir = Path(__file__).parent / "models"
+    print("=" * 80)
+    print("Classifier Training Pipeline")
+    print("=" * 80)
+    print(f"Run name: {config.run_name}")
+    print(f"Description: {config.description}")
+    print(f"Transformer: {config.transformer_name}")
+    print(f"Model: {config.model_name}")
+    print(f"Data subset: {config.data_subset}")
+    print(f"Test size: {config.test_size}")
+    print(f"Random state: {config.random_state}")
+    print(f"Models directory: {config.models_dir}")
+    print("=" * 80)
+    
+    # Ensure directories exist
+    config.ensure_directories_exist()
+    
+    # Save configuration
+    config.save_config()
+    
+    # Get classes
+    data_transformer_class = AVAILABLE_TRANSFORMERS[config.transformer_name]
+    classification_model_class = AVAILABLE_MODELS[config.model_name]
+    
+    # Run training
+    results = defaultdict(lambda: defaultdict(dict))
+    
+    try:
+        results[data_transformer_class.__name__][classification_model_class.__name__] = run_single_experiment(
+            config=config,
+            data_transformer_class=data_transformer_class,
+            classification_model_class=classification_model_class,
+            data_transformer_params=config.transformer_params,
+            classification_model_params=config.model_params,
+        )
+    except Exception as e:
+        print(f"Error during training: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    
+    # Save results
+    save_results(config.results_dir, dict(results), config)
+    
+    print("\n" + "=" * 80)
+    print("Training completed!")
+    print(f"Models saved to: {config.models_dir}")
+    print(f"Config saved to: {config.models_dir / 'training_config.json'}")
+    print("=" * 80)
+    
+    return dict(results)
 
-    results_dir.mkdir(parents=True, exist_ok=True)
-    models_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine which combinations to run
-    if transformers is None:
-        transformers = list(AVAILABLE_TRANSFORMERS.keys())
-    if models is None:
-        models = list(AVAILABLE_MODELS.keys())
-    
-    # Validate transformer names
-    invalid_transformers = [t for t in transformers if t not in AVAILABLE_TRANSFORMERS]
-    if invalid_transformers:
-        raise ValueError(f"Invalid transformer names: {invalid_transformers}. Available: {list(AVAILABLE_TRANSFORMERS.keys())}")
-    
-    # Validate model names
-    invalid_models = [m for m in models if m not in AVAILABLE_MODELS]
-    if invalid_models:
-        raise ValueError(f"Invalid model names: {invalid_models}. Available: {list(AVAILABLE_MODELS.keys())}")
-    
-    # Build combinations to run
-    combinations_to_run = []
-    for transformer_name in transformers:
-        valid_models_for_transformer = VALID_COMBINATIONS.get(transformer_name, models)
-        for model_name in models:
-            if model_name in valid_models_for_transformer:
-                combinations_to_run.append((transformer_name, model_name))
-            else:
-                print(f"Warning: Skipping invalid combination {transformer_name} + {model_name}")
-    
-    if not combinations_to_run:
-        raise ValueError("No valid combinations found. Check transformer and model selections.")
-    
-    print(f"Running {len(combinations_to_run)} experiment(s):")
-    for trans, mod in combinations_to_run:
-        print(f"  - {trans} + {mod}")
-    
-    results = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float)))))
-    
-    # Run experiments
-    for transformer_name, model_name in combinations_to_run:
-        data_transformer_class = AVAILABLE_TRANSFORMERS[transformer_name]
-        classification_model_class = AVAILABLE_MODELS[model_name]
-        
-        transformer_params = (data_transformer_params or {}).get(transformer_name, {})
-        model_params = (classification_model_params or {}).get(model_name, {})
-        
-        print(f"\n{'='*60}")
-        print(f"Running: {transformer_name} + {model_name}")
-        print(f"{'='*60}")
-        
-        try:
-            results[data_transformer_class.__name__][classification_model_class.__name__] = run_single_experiment(
-                path_to_models=models_dir,
-                path_to_results=results_dir,
-                data_transformer_class=data_transformer_class,
-                classification_model_class=classification_model_class,
-                data_transformer_params=transformer_params,
-                classification_model_params=model_params,
-                test_size=test_size,
-                random_state=random_state,
-            )
-        except Exception as e:
-            print(f"Error running {transformer_name} + {model_name}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-    
-    # Generate suffix if not provided
-    if suffix is None:
-        suffix = "_".join(sorted(set([t for t, _ in combinations_to_run])))
-    
-    save_results(results_dir, results, suffix=suffix)
-    print(f"\n{'='*60}")
-    print(f"All experiments completed! Results saved with suffix: {suffix}")
-    print(f"{'='*60}")
-
+# ============================================================================
+# COMMAND LINE INTERFACE
+# ============================================================================
 
 def parse_args():
-    """Parse command-line arguments"""
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run ML classification experiments with different transformers and models",
+        description="Train ML classification models with configurable settings",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Run all valid combinations
-  python main.py
-  
-  # Run specific transformer with all compatible models
-  python main.py --transformers modern_bert
-  
-  # Run specific transformer and model
-  python main.py --transformers tfidf --models logistic_regression
-  
-  # Run multiple transformers and models
-  python main.py --transformers tfidf sentence_embedding --models logistic_regression random_forest
-  
-  # Run with custom test size and random state
-  python main.py --test-size 0.3 --random-state 123
-        """
+    Examples:
+    # Train ModernBERT with default settings
+    python main.py --run-name my_experiment
+    
+    # Train with specific transformer and model
+    python main.py --run-name tfidf_logreg --transformers tfidf --models logistic_regression
+    
+    # Train on one-author data subset
+    python main.py --run-name modernbert_one_author --data-subset one_author
+    
+    # Train with custom description
+    python main.py --run-name experiment_v2 --description "Testing with 10 epochs"
+
+    After training, use the models in classification:
+    from backend.src.steering.classification.classify_generated import run_classification_from_configs
+    results = run_classification_from_configs(
+        generation_run_dir="data/steering/tests/my_run",
+        classifier_run_name="my_experiment"
+    )
+            """
+    )
+    
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        required=True,
+        help="Name for this training run. Models will be saved to models/{run_name}/"
+    )
+    
+    parser.add_argument(
+        "--description",
+        type=str,
+        default="",
+        help="Description of this training run"
     )
     
     parser.add_argument(
         "--transformers",
         nargs="+",
         choices=list(AVAILABLE_TRANSFORMERS.keys()),
-        default=None,
-        help="List of transformers to use. If not specified, runs all valid combinations."
+        default=["modern_bert"],
+        help="Transformer to use (default: modern_bert)"
     )
     
     parser.add_argument(
         "--models",
         nargs="+",
         choices=list(AVAILABLE_MODELS.keys()),
-        default=None,
-        help="List of models to use. If not specified, runs all valid combinations."
+        default=["modern_bert"],
+        help="Model to use (default: modern_bert)"
+    )
+    
+    parser.add_argument(
+        "--data-subset",
+        type=str,
+        default="one_author",
+        choices=["all", "one_author"],
+        help="Data subset to use for training (default: one_author)"
     )
     
     parser.add_argument(
@@ -315,22 +432,64 @@ Examples:
     )
     
     parser.add_argument(
-        "--suffix",
+        "--base-dir",
         type=str,
-        default=None,
-        help="Optional suffix for result files"
+        default="backend/src/steering/classification/models",
+        help="Base directory for saving models (default: backend/src/steering/classification/models)"
     )
     
     return parser.parse_args()
-  
 
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 
 if __name__ == "__main__":
     args = parse_args()
-    run_experiments(
-        transformers=args.transformers,
-        models=args.models,
-        test_size=args.test_size,
-        random_state=args.random_state,
-        suffix=args.suffix
-    )
+    
+    # Multiple combinations of transformer/model should use multiple runs
+    if len(args.transformers) > 1 or len(args.models) > 1:
+        print("Warning: Multiple transformers/models specified. Running each as separate experiment.")
+        for transformer in args.transformers:
+            for model in args.models:
+                # Check if valid combination
+                if model not in VALID_COMBINATIONS.get(transformer, []):
+                    print(f"Skipping invalid combination: {transformer} + {model}")
+                    continue
+                
+                run_name = f"{args.run_name}_{transformer}_{model}"
+                config = ClassifierTrainingConfig(
+                    run_name=run_name,
+                    description=args.description,
+                    base_dir=Path(args.base_dir),
+                    transformer_name=transformer,
+                    transformer_params={"ngram_range": (1, 3), "max_features": 5000},
+                    model_name=model,
+                    data_subset=args.data_subset,
+                    test_size=args.test_size,
+                    random_state=args.random_state,
+                )
+                run_training(config)
+    else:
+
+        # Validate combination
+        valid_models = VALID_COMBINATIONS.get(args.transformers[0], [])
+        if args.models[0] not in valid_models:
+            raise ValueError(
+                f"Invalid combination: {args.transformers[0]} + {args.models[0]}. "
+                f"Valid models for {args.transformers[0]}: {valid_models}"
+            )
+        # Single transformer/model - use run_name as-is
+        config = ClassifierTrainingConfig(
+            run_name=args.run_name,
+            description=args.description,
+            base_dir=Path(args.base_dir),
+            transformer_name=args.transformers[0],
+            transformer_params={"ngram_range": (1, 3)},
+            model_name=args.models[0],
+            data_subset=args.data_subset,
+            test_size=args.test_size,
+            random_state=args.random_state,
+        )
+        run_training(config)

@@ -202,13 +202,17 @@ def generate_output_path(data_path: str, analysis_type: str, run_name: Optional[
     path_str = str(relative_path)
     
     # Replace raw_features or raw_dense_features with output_data
+    # Or if already in output_data (e.g., residual activations), just use it directly
     if 'raw_features' in path_str:
         output_path_str = path_str.replace('raw_features', 'output_data', 1)
     elif 'raw_dense_features' in path_str:
         output_path_str = path_str.replace('raw_dense_features', 'output_data', 1)
+    elif 'output_data' in path_str:
+        # Path already points to output_data (e.g., residual activations from previous analysis)
+        output_path_str = path_str
     else:
         raise ValueError(f"Could not determine output path from data path: {data_path}. "
-                        f"Expected path to contain 'raw_features' or 'raw_dense_features'")
+                        f"Expected path to contain 'raw_features', 'raw_dense_features', or 'output_data'")
     
     # If run_name override is provided, replace the last part before analysis_type
     if run_name:

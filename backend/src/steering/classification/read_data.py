@@ -69,3 +69,36 @@ class DataReader:
         y = pd.Series(y)
 
         return X, y
+
+    @staticmethod
+    def read_news_generated_data() -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+        """Read test and training generated news JSON files"""
+        logger.info("Loading news generated dataset...")
+        dir_path = "data/steering/tests"
+        training_file_path = os.path.join(dir_path, "generated_training_texts__baseline.json")
+        test_file_path = os.path.join(dir_path, "generated_texts__baseline.json")
+
+        with open(training_file_path, "r", encoding="utf-8") as f:
+            dataset_training = json.load(f)
+        with open(test_file_path, "r", encoding="utf-8") as f:
+            dataset_test = json.load(f)
+
+        X_training = []
+        y_training = []
+        X_test = []
+        y_test = []
+
+        for doc in dataset_training:
+            X_training.append(doc["original_article"])
+            y_training.append(doc["author"])
+            X_training.append(doc["generated_text"])
+            y_training.append(f"{doc['author']} generated")
+        
+        for doc in dataset_test:
+            X_test.append(doc["original_article"])
+            y_test.append(doc["author"])
+            X_test.append(doc["generated_text"])
+            y_test.append(f"{doc['author']} generated")
+            
+
+        return pd.Series(X_training), pd.Series(X_test), pd.Series(y_training), pd.Series(y_test)

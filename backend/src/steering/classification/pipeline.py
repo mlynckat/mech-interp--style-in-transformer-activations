@@ -101,3 +101,29 @@ class MLPipeline:
         predictions = self.classification_model.predict(X_transformed)
 
         return predictions
+    
+    def predict_proba_samples(self, X: pd.Series) -> pd.Series:
+        """
+        Predict probabilities for samples
+        
+        Args:
+            X: Samples to predict
+        
+        Returns:
+            Probabilities of class 1
+        """
+        # Step 1: Transform data
+        print("Transforming data...")
+
+        if self.data_transformer.__class__.__name__ == "TFIDFTransformer":
+            self.data_transformer.load_model()
+
+        self.classification_model.load_model()
+        
+        X_transformed = self.data_transformer.transform(X)
+
+        # Step 2: Predict probabilities
+        print("Predicting probabilities...")
+        probas = self.classification_model.predict_proba(X_transformed)
+
+        return probas

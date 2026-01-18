@@ -110,6 +110,8 @@ beautifulsoup4==4.13.5
 umap-learn==0.5.9.post2
 shap==0.48.0
 openai==2.7.1
+spacy==3.8.11
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 --extra-index-url=https://pypi.nvidia.com
 cudf-cu12==25.8.*
 dask-cudf-cu12==25.8.*

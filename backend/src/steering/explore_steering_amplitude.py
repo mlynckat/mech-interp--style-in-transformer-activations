@@ -32,17 +32,22 @@ login(token=os.environ["HF_TOKEN"])
 
 
 base_dir = Path("data/steering/explore_steering_amplitude")
-os.makedirs(base_dir, exist_ok=True)
+run_suffix = "with_rec_loss__pt_15_res_saes"
+output_dir = base_dir / run_suffix
+os.makedirs(output_dir, exist_ok=True)
+
 
 input_filename = "prompts_test_data.json"
 output_filename_cosine_similarity = "cosine_similarity__{}.csv" 
 output_filename_euclidian_distance = "euclidian_distance__{}.csv" 
+output_filename_reconstruction_loss = "reconstruction_loss__{}.csv"
 input_file = base_dir / input_filename
-output_path_cosine_similarity = base_dir / output_filename_cosine_similarity
-output_path_euclidian_distance = base_dir / output_filename_euclidian_distance
+output_path_cosine_similarity = output_dir / output_filename_cosine_similarity
+output_path_euclidian_distance = output_dir / output_filename_euclidian_distance
+output_path_reconstruction_loss = output_dir / output_filename_reconstruction_loss
 path_to_logreg_models = Path("data/output_data/news/politics/google_gemma-2-9b-it/prepare_features_for_steering/feature_selection_aggregated")
 path_to_most_important_features = Path("data/output_data/news/politics/google_gemma-2-9b-it/prepare_features_for_steering/feature_selection_aggregated/most_important_features__res__15.json")
-output_path_samples = base_dir / "samples__{}.json"
+output_path_samples = output_dir / "samples__{}.json"
 
 
 with open(path_to_most_important_features, "r") as f:
@@ -73,37 +78,35 @@ class SAESteeringAmplitudeGenerator:
         model_name: str = "google/gemma-2-9b-it",
         sae_release: str = "gemma-scope-9b-pt-res",
         sae_id: str = "layer_15/width_16k/average_l0_131",
-        classifier_path: str = "classifier.pkl", # TODO: change to the actual path
+        classifier_path: str = "classifier.pkl",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         fold_ln: bool = True
     ):
-        """
-        Initialize SAE Steering Generator.
         
-        Note on fold_ln parameter:
-        - fold_ln=True folds layer normalization into weights, which modifies model behavior
-        - This is typically required for SAE compatibility, but causes outputs to differ from
-          standard AutoModelForCausalLM (used in baseline_text_generation.py)
-        - If you need outputs to match baseline, try fold_ln=False, but SAE may not work correctly
-        """
+        # Initialize SAE Steering Generator.
         self.device = device
         
         
         # Load hooked SAE transformer
         print("Loading hooked SAE transformer...")
         print(f"Using fold_ln={fold_ln} (NOTE: fold_ln=True changes model architecture and may cause different outputs vs baseline)")
-        self.model = HookedSAETransformer.from_pretrained(
+        """self.model = HookedSAETransformer.from_pretrained(
             model_name,
             fold_ln=fold_ln,
             center_writing_weights=False,
             center_unembed=False,
-            device = device)
+            device = device)"""
+
+        self.model = HookedSAETransformer.from_pretrained_no_processing(
+            model_name,
+            device=device
+        )
 
         self.tokenizer = self.model.tokenizer
         
         # Load SAE
         print(f"Loading SAE: {sae_id}")
-        self.sae, _, _ = SAE.from_pretrained(
+        self.sae = SAE.from_pretrained(
             release=sae_release,
             sae_id=sae_id,
             device=device
@@ -125,6 +128,14 @@ class SAESteeringAmplitudeGenerator:
         else:
             raise ValueError("Classifier must have coef_ attribute (LogisticRegression)")
         
+        # Get classifier intercept (bias term) - CRITICAL for correct probability calculation
+        if hasattr(self.classifier, 'intercept_'):
+            self.classifier_intercept = self.classifier.intercept_[0]
+            logger.info(f"Loaded classifier intercept: {self.classifier_intercept}")
+        else:
+            logger.warning("Classifier has no intercept_ attribute, defaulting to 0.0")
+            self.classifier_intercept = 0.0
+        
         self.steering_hook = None
         self.steering_mechanism = None
         self.feature_max_activations: dict[int, float] | None = None
@@ -138,10 +149,13 @@ class SAESteeringAmplitudeGenerator:
         config: SteeringConfig
     ):
         """Set the steering mechanism to use."""
+        # Get intercept (default to 0.0 if not available)
+        intercept = self.classifier_intercept if hasattr(self, 'classifier_intercept') and self.classifier_intercept is not None else 0.0
+        
         if mechanism == "heuristic":
-            self.steering_mechanism = HeuristicSteering(config, self.classifier_weights)
+            self.steering_mechanism = HeuristicSteering(config, self.classifier_weights, intercept)
         elif mechanism == "projected_gradient":
-            self.steering_mechanism = ProjectedGradientSteering(config, self.classifier_weights)
+            self.steering_mechanism = ProjectedGradientSteering(config, self.classifier_weights, intercept)
         else:
             raise ValueError(f"Unknown mechanism: {mechanism}")
         
@@ -187,6 +201,7 @@ class SAESteeringAmplitudeGenerator:
         self, 
         output_data_cosine_similarity: dict, 
         output_data_euclidian_distance: dict,
+        output_data_reconstruction_loss: dict,
         steered_token_positions: Optional[Union[List[int], Set[int], str]] = None
     ):
         """Create hook function for steering with token position control."""
@@ -245,6 +260,11 @@ class SAESteeringAmplitudeGenerator:
                         )
                         euclidian_distance = torch.norm(steered_activations - reconstructed_original_activations, dim=-1)
                         
+                        # Reconstruction loss: MSE between original activations and SAE reconstruction
+                        reconstruction_loss = torch.nn.functional.mse_loss(
+                            reconstructed_original_activations, activations, reduction='none'
+                        ).mean(dim=-1)  # Mean across hidden_dim to get per-token loss
+                        
                         # Take mean across all dimensions except the last one (feature dimension)
                         # This gives us a single scalar value per token position
                         if cosine_similarity.ndim > 1:
@@ -253,13 +273,18 @@ class SAESteeringAmplitudeGenerator:
                         if euclidian_distance.ndim > 1:
                             # Average across batch dimension if present
                             euclidian_distance = euclidian_distance.mean(dim=0)
+                        if reconstruction_loss.ndim > 1:
+                            # Average across batch dimension if present
+                            reconstruction_loss = reconstruction_loss.mean(dim=0)
                         
                         # Now average across sequence length to get a single value per forward pass
                         cosine_val = cosine_similarity.mean().item()
                         euclidian_val = euclidian_distance.mean().item()
+                        reconstruction_loss_val = reconstruction_loss.mean().item()
                         
                         output_data_cosine_similarity[alpha].append(cosine_val)
                         output_data_euclidian_distance[alpha].append(euclidian_val)
+                        output_data_reconstruction_loss[alpha].append(reconstruction_loss_val)
                     
                     logger.debug(f"Hook completed. Cosine dict length: {len(output_data_cosine_similarity.get(list(output_data_cosine_similarity.keys())[0], []))}")
                     
@@ -279,6 +304,7 @@ class SAESteeringAmplitudeGenerator:
         cosine_similarities: list[float], 
         euclidian_distances: list[float], 
         relative_changes: list[float],
+        confidence_scores: list[float],
         steered_token_positions: Optional[Union[List[int], Set[int], str]] = None
     ):
         """Create hook function for steering with token position control."""
@@ -319,26 +345,32 @@ class SAESteeringAmplitudeGenerator:
                         logger.warning(f"ERROR: delta_x contains NaN or Inf for alpha {alpha}; skipping.")
                         return activations
                     
-                    steered_feats = sae_features + delta_x
+                    #steered_feats = sae_features + delta_x
+                    delta_activation = self.sae.decode(sae_features + delta_x) - self.sae.decode(sae_features)
+    
                     
-                    if torch.isnan(steered_feats).any() or torch.isinf(steered_feats).any():
+                    if torch.isnan(delta_activation).any() or torch.isinf(delta_activation).any():
                         logger.warning(f"ERROR: steered_feats contain NaN/Inf for alpha {alpha}; skipping.")
                         return activations
                     
-                    steered_activations = self.sae.decode(steered_feats).to(activations.dtype)
-                    reconstructed_original_activations = self.sae.decode(sae_features)
+                    #steered_activations = self.sae.decode(steered_feats).to(activations.dtype)
+                    steered_activations = activations + delta_activation
                         
                     # Handle multi-dimensional tensors - compute mean across batch and sequence dimensions
                     # activations shape is typically [batch, seq_len, hidden_dim]
                     cosine_similarity = torch.nn.functional.cosine_similarity(
-                        steered_activations, reconstructed_original_activations, dim=-1
+                        steered_activations, activations, dim=-1
                     )
-                    euclidian_distance = torch.norm(steered_activations - reconstructed_original_activations, dim=-1)
+                    euclidian_distance = torch.norm(steered_activations - activations, dim=-1)
+
+                    confidence_score = self.steering_mechanism.calculate_confidence(sae_features + delta_x)
+                    
                     cosine_val = cosine_similarity.mean().item()
                     euclidian_val = euclidian_distance.mean().item()
                     
                     cosine_similarities.append(cosine_val)
                     euclidian_distances.append(euclidian_val)
+                    confidence_scores.append(confidence_score.item())
 
                     activation_norm = torch.norm(activations, dim=-1).mean().item()
                     relative_change = euclidian_val / activation_norm if activation_norm > 0 else 0.0
@@ -376,12 +408,17 @@ class SAESteeringAmplitudeGenerator:
         Returns:
             Generated text (without prompt)
         """
+        # CRITICAL: Reset model state before processing a new prompt
+        # This ensures no state from previous prompts persists
+        self.model.reset_hooks()
+        
         # Tokenize input
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
             add_special_tokens=True  
         ).to(self.device)
+        
         prompt_length = inputs.input_ids.shape[1]
         self._prompt_length = prompt_length
         self._token_position = 0
@@ -392,6 +429,12 @@ class SAESteeringAmplitudeGenerator:
             cosine_similarities = []
             euclidian_distances = []
             relative_changes = []
+            confidence_scores = []
+            
+            # CRITICAL: Reset all hooks and caches before each generation
+            # This prevents state from previous alphas/prompts from persisting
+            self.model.reset_hooks()
+            
             # Set up steering hook if steered generation
             hook_point = self.sae.cfg.metadata.hook_name
             steering_fn = self._create_steering_hook_for_alpha(
@@ -399,6 +442,7 @@ class SAESteeringAmplitudeGenerator:
                 cosine_similarities, 
                 euclidian_distances, 
                 relative_changes,
+                confidence_scores,
                 steered_token_positions=steered_token_positions
             )
             self.steering_hook = self.model.add_hook(hook_point, steering_fn)
@@ -419,6 +463,7 @@ class SAESteeringAmplitudeGenerator:
                 current_output_data[alpha]["average_cosine_similarity"] = sum(cosine_similarities) / len(cosine_similarities)
                 current_output_data[alpha]["average_euclidian_distance"] = sum(euclidian_distances) / len(euclidian_distances)
                 current_output_data[alpha]["average_relative_change"] = sum(relative_changes) / len(relative_changes)
+                current_output_data[alpha]["average_confidence"] = sum(confidence_scores) / len(confidence_scores)
                 
                 # Validate outputs
                 if outputs is None or len(outputs) == 0:
@@ -450,6 +495,7 @@ class SAESteeringAmplitudeGenerator:
                 current_output_data[alpha]["cosine_similarities"] = None
                 current_output_data[alpha]["euclidian_distances"] = None
                 current_output_data[alpha]["relative_changes"] = None
+                current_output_data[alpha]["confidence_scores"] = None
                 current_output_data[alpha]["generated_text"] = None
                 return current_output_data
                 
@@ -467,9 +513,14 @@ class SAESteeringAmplitudeGenerator:
         max_new_tokens,
         output_data_cosine_similarity,
         output_data_euclidian_distance,
+        output_data_reconstruction_loss,
         steered_token_positions: Optional[Union[List[int], Set[int], str]] = None
     ):
         """Retrieve metrics for the given prompt."""
+        # CRITICAL: Reset model state before processing a new prompt
+        # This ensures no state from previous prompts persists
+        self.model.reset_hooks()
+        
         # Tokenize input
         inputs = self.tokenizer(
             prompt,
@@ -482,11 +533,12 @@ class SAESteeringAmplitudeGenerator:
 
         hook_point = self.sae.cfg.metadata.hook_name
         logger.info(f"Setting up hook at: {hook_point}")
-        logger.info(f"Initial dict sizes - Cosine: {[len(v) for v in output_data_cosine_similarity.values()]}, Euclidean: {[len(v) for v in output_data_euclidian_distance.values()]}")
+        logger.info(f"Initial dict sizes - Cosine: {[len(v) for v in output_data_cosine_similarity.values()]}, Euclidean: {[len(v) for v in output_data_euclidian_distance.values()]}, Reconstruction: {[len(v) for v in output_data_reconstruction_loss.values()]}")
         
         steering_fn = self._create_steering_hook(
             output_data_cosine_similarity, 
             output_data_euclidian_distance,
+            output_data_reconstruction_loss,
             steered_token_positions=steered_token_positions
         )
         self.steering_hook = self.model.add_hook(hook_point, steering_fn)
@@ -506,7 +558,7 @@ class SAESteeringAmplitudeGenerator:
                 )
             
             logger.info(f"Generation completed. Output shape: {outputs.shape if hasattr(outputs, 'shape') else type(outputs)}")
-            logger.info(f"Final dict sizes - Cosine: {[len(v) for v in output_data_cosine_similarity.values()]}, Euclidean: {[len(v) for v in output_data_euclidian_distance.values()]}")
+            logger.info(f"Final dict sizes - Cosine: {[len(v) for v in output_data_cosine_similarity.values()]}, Euclidean: {[len(v) for v in output_data_euclidian_distance.values()]}, Reconstruction: {[len(v) for v in output_data_reconstruction_loss.values()]}")
             
         except Exception as e:
             logger.error(f"Error during generation: {e}")
@@ -519,7 +571,7 @@ class SAESteeringAmplitudeGenerator:
                 self.steering_hook = None
                 logger.info("Hook removed")
         
-        return output_data_cosine_similarity, output_data_euclidian_distance
+        return output_data_cosine_similarity, output_data_euclidian_distance, output_data_reconstruction_loss
 
 def run_on_gpu(
     rank,
@@ -528,6 +580,7 @@ def run_on_gpu(
     path_to_logreg_models,
     output_path_cosine_similarity,
     output_path_euclidian_distance,
+    output_path_reconstruction_loss,
     test_data,
     model_name,
     sae_release,
@@ -543,9 +596,9 @@ def run_on_gpu(
         author_subsets: List of lists, where author_subsets[rank] contains authors for this GPU
         steered_features: Dictionary mapping author to list of feature indices
         path_to_logreg_models: Path to directory containing classifier models
-        base_dir: Base directory for output files
         output_path_cosine_similarity: Path to directory for cosine similarity output
         output_path_euclidian_distance: Path to directory for euclidian distance output
+        output_path_reconstruction_loss: Path to directory for reconstruction loss output
         test_data: List of test prompts/entries
         model_name: Model name to use
         sae_release: SAE release name
@@ -569,14 +622,17 @@ def run_on_gpu(
         logger.info(f"\n=== GPU {rank} Processing Author {author_idx + 1}/{len(authors_for_this_gpu)}: {author} ===")
         file_name_cosine_similarity = str(output_path_cosine_similarity).format(author)
         file_name_euclidian_distance = str(output_path_euclidian_distance).format(author)
+        file_name_reconstruction_loss = str(output_path_reconstruction_loss).format(author)
 
         output_data_cosine_similarity = {}
         output_data_euclidian_distance = {}
+        output_data_reconstruction_loss = {}
 
         alphas = [0.0, 0.01, 0.03, 0.05, 0.07, 0.09, 0.11, 0.13, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         for alpha in alphas:
             output_data_cosine_similarity[alpha] = []
             output_data_euclidian_distance[alpha] = []
+            output_data_reconstruction_loss[alpha] = []
 
         try:
             classifier_path = path_to_logreg_models / f"logreg_model__res__15__{author}__shap_best_16.pkl"
@@ -593,7 +649,6 @@ def run_on_gpu(
                 mu_norm=0.01,
                 max_iterations=20,
                 target_confidence=0.7,
-                max_relative_rec_loss=0.01,  # 1% increase allowed
                 num_features=16384
             )
             
@@ -612,11 +667,12 @@ def run_on_gpu(
                 if max_test_entries is not None and index >= max_test_entries:
                     break
                 prompt = entry["prompt"]
-                output_data_cosine_similarity, output_data_euclidian_distance = generator.retrieve_metrics(
+                output_data_cosine_similarity, output_data_euclidian_distance, output_data_reconstruction_loss = generator.retrieve_metrics(
                     prompt,
                     max_new_tokens=500,
                     output_data_cosine_similarity=output_data_cosine_similarity,
                     output_data_euclidian_distance=output_data_euclidian_distance,
+                    output_data_reconstruction_loss=output_data_reconstruction_loss,
                     steered_token_positions=steered_token_positions
                 )
             
@@ -630,26 +686,32 @@ def run_on_gpu(
             logger.info(f"Cosine similarity dict keys: {list(output_data_cosine_similarity.keys())}")
             logger.info(f"Cosine similarity dict lengths: {[(k, len(v)) for k, v in output_data_cosine_similarity.items()]}")
             logger.info(f"Euclidean distance dict lengths: {[(k, len(v)) for k, v in output_data_euclidian_distance.items()]}")
+            logger.info(f"Reconstruction loss dict lengths: {[(k, len(v)) for k, v in output_data_reconstruction_loss.items()]}")
             
             # Check if data is empty
             total_cosine_values = sum(len(v) for v in output_data_cosine_similarity.values())
             total_euclidean_values = sum(len(v) for v in output_data_euclidian_distance.values())
+            total_reconstruction_values = sum(len(v) for v in output_data_reconstruction_loss.values())
             
             if total_cosine_values == 0:
                 logger.warning(f"WARNING: No cosine similarity data collected for {author}!")
             if total_euclidean_values == 0:
                 logger.warning(f"WARNING: No euclidean distance data collected for {author}!")
+            if total_reconstruction_values == 0:
+                logger.warning(f"WARNING: No reconstruction loss data collected for {author}!")
             
             # Write CSV files
             df_cosine = pd.DataFrame.from_dict(output_data_cosine_similarity)
             df_euclidean = pd.DataFrame.from_dict(output_data_euclidian_distance)
+            df_reconstruction = pd.DataFrame.from_dict(output_data_reconstruction_loss)
             
-            logger.info(f"DataFrame shapes - Cosine: {df_cosine.shape}, Euclidean: {df_euclidean.shape}")
+            logger.info(f"DataFrame shapes - Cosine: {df_cosine.shape}, Euclidean: {df_euclidean.shape}, Reconstruction: {df_reconstruction.shape}")
             
             df_cosine.to_csv(file_name_cosine_similarity)
             df_euclidean.to_csv(file_name_euclidian_distance)
+            df_reconstruction.to_csv(file_name_reconstruction_loss)
             
-            logger.info(f"CSV files written: {file_name_cosine_similarity}, {file_name_euclidian_distance}")
+            logger.info(f"CSV files written: {file_name_cosine_similarity}, {file_name_euclidian_distance}, {file_name_reconstruction_loss}")
             
         except Exception as e:
             logger.error(f"GPU {rank}: Error processing author {author}: {e}")
@@ -680,7 +742,6 @@ def run_sample_generation_on_gpu(
         author_subsets: List of lists, where author_subsets[rank] contains authors for this GPU
         steered_features: Dictionary mapping author to list of feature indices
         path_to_logreg_models: Path to directory containing classifier models
-        base_dir: Base directory for output files
         output_path_samples_file: Path to file to save  for samples output
         test_data: List of test prompts/entries
         model_name: Model name to use
@@ -723,7 +784,6 @@ def run_sample_generation_on_gpu(
                 mu_norm=0.01,
                 max_iterations=20,
                 target_confidence=0.7,
-                max_relative_rec_loss=0.01,  # 1% increase allowed
                 num_features=16384
             )
             
@@ -835,7 +895,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-test-entries",
         type=int,
-        default=10,
+        default=20,
         help="Maximum number of test entries to process per author (for testing)"
     )
     
@@ -887,6 +947,7 @@ if __name__ == "__main__":
                     path_to_logreg_models,
                     output_path_cosine_similarity,
                     output_path_euclidian_distance,
+                    output_path_reconstruction_loss,
                     test_data,
                     model_name,
                     sae_release,
@@ -906,6 +967,7 @@ if __name__ == "__main__":
                 path_to_logreg_models,
                 output_path_cosine_similarity,
                 output_path_euclidian_distance,
+                output_path_reconstruction_loss,
                 test_data,
                 model_name,
                 sae_release,

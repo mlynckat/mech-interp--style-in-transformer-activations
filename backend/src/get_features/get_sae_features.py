@@ -194,7 +194,8 @@ class ActivationStorage:
             padding_mask=self.padding_mask
         )"""
         np.savez(data_path, self.activations)
-        metadata.save(meta_path)
+        # Pass the activation filename (data_path) to save metadata
+        metadata.save(str(data_path))
         
         return data_path, meta_path
     
@@ -229,7 +230,8 @@ class ActivationStorage:
                 )
         
         sp.save_npz(data_path, sparse_matrix)
-        metadata.save(meta_path)
+        # Pass the activation filename (data_path) to save metadata
+        metadata.save(str(data_path))
         
         return data_path, meta_path
 
@@ -346,11 +348,8 @@ def load_model(model_config: ModelConfig, device):
     Load the model for the given rank (given GPU).
     """
     logger.info(f"Loading model {model_config.model_name} on {device}")
-    model = HookedSAETransformer.from_pretrained(
+    model = HookedSAETransformer.from_pretrained_no_processing(
         model_config.model_name,
-        fold_ln=True,
-        center_writing_weights=False,
-        center_unembed=False,
         device = device)
     model.eval()
 
@@ -689,11 +688,43 @@ def main(parsed_args):
     
     world_size = torch.cuda.device_count()
 
-    valid_authors = [
-    author for author in dataset_config.author_list
-    if len(author_to_docs[author]) >= dataset_config.max_n_docs_per_author
-    ]
+    # Filter authors that have enough documents
+    valid_authors = []
+    skipped_authors = []
+    for author in dataset_config.author_list:
+        n_docs = len(author_to_docs[author])
+        if n_docs >= dataset_config.max_n_docs_per_author:
+            valid_authors.append(author)
+        else:
+            skipped_authors.append((author, n_docs))
+    
+    # Log filtering results
+    logger.info(f"=== Author Filtering Results ===")
+    logger.info(f"Required docs per author: {dataset_config.max_n_docs_per_author}")
+    logger.info(f"Total authors in dataset: {len(dataset_config.author_list)}")
+    logger.info(f"Valid authors (>= {dataset_config.max_n_docs_per_author} docs): {len(valid_authors)}")
+    
+    if skipped_authors:
+        logger.warning(f"Skipped {len(skipped_authors)} authors with insufficient documents:")
+        for author, n_docs in skipped_authors:
+            logger.warning(f"  {author}: {n_docs} docs (need {dataset_config.max_n_docs_per_author})")
+    
+    if not valid_authors:
+        raise ValueError(
+            f"No authors have >= {dataset_config.max_n_docs_per_author} documents! "
+            f"Consider lowering --n_docs_per_author. "
+            f"Max available: {max(len(author_to_docs[a]) for a in dataset_config.author_list) if dataset_config.author_list else 0}"
+        )
+    
+    logger.info(f"Valid authors to process: {valid_authors}")
+    logger.info(f"================================")
+    
     author_subsets = [valid_authors[i::world_size] for i in range(world_size)]
+    
+    # Log distribution across GPUs
+    logger.info(f"Distributing {len(valid_authors)} authors across {world_size} GPUs:")
+    for gpu_idx, subset in enumerate(author_subsets):
+        logger.info(f"  GPU {gpu_idx}: {len(subset)} authors - {subset}")
 
     # Run multi-GPU inference 
     logger.info("Starting multi-GPU inference...")
@@ -772,7 +803,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_docs",
         type=int,
-        default=4000,
+        default=None,
         help="Total number of documents to analyze"
     )
     parser.add_argument(
@@ -784,7 +815,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min_length_doc",
         type=int,
-        default=35,
+        default=None,
         help="Minimum document length"
     )
     parser.add_argument(
@@ -827,7 +858,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run_name",
         type=str,
-        default="news_500_politics",
+        default="sae_features_news_politics_cleaned",
         help="Name of the run to create a folder in outputs"
     )
 

@@ -64,16 +64,38 @@ class ActivationMetadata:
     layer_index: int
     sae_id: str
     model_name: str
+
+
+    @staticmethod
+    def get_metadata_filename(activation_filename: str) -> str:
+        """
+        Get base filename without .npz or .sparse.npz extension.
+        
+        Args:
+            filename: Filename with extension (e.g., 'file.sparse.npz' or 'file.npz')
+            
+        Returns:
+            Base filename without extension (e.g., 'file')
+        """
+        if activation_filename.endswith('.sparse.npz'):
+            return activation_filename[:-11] + '.meta.pkl'  # Remove .sparse.npz and add .meta.pkl
+        elif activation_filename.endswith('.npz'):
+            return activation_filename[:-4] + '.meta.pkl'   # Remove .npz and add .meta.pkl
+        else:
+            return activation_filename + '.meta.pkl'
+        return activation_filename
     
-    def save(self, filepath: Path):
+    def save(self, activation_filename: str):
         """Save metadata to pickle file."""
-        with open(filepath, 'wb') as f:
+        metadata_filename = ActivationMetadata.get_metadata_filename(activation_filename)
+        with open(metadata_filename, 'wb') as f:
             pickle.dump(self, f)
     
     @staticmethod
-    def load(filepath: Path):
+    def load(activation_filename: str):
         """Load metadata from pickle file."""
-        with open(filepath, 'rb') as f:
+        metadata_filename = ActivationMetadata.get_metadata_filename(activation_filename)
+        with open(metadata_filename, 'rb') as f:
             return pickle.load(f)
     
     def get_position(self, doc_idx: int, tok_idx: int) -> Optional[int]:
@@ -129,43 +151,32 @@ class FeatureImportanceMetrics:
 
 
 class AuthorColorManager:
-    """Manages consistent color mapping for authors across all visualizations"""
+    """
+    Manages consistent color mapping for authors across all visualizations.
     
-    def __init__(self, color_palette: str = 'tab10'):
+    Uses the Nordic Ocean Extended Theme color palette for cohesive aesthetics
+    across all visualizations in the project.
+    """
+    
+    def __init__(self, color_palette: str = 'nordic_ocean'):
         """
         Initialize the color manager with a specific color palette.
         
         Args:
-            color_palette: Name of matplotlib/seaborn color palette to use
+            color_palette: Name of color palette to use ('nordic_ocean' or matplotlib palette name)
         """
         self.color_palette = color_palette
         self.author_to_color = {}
         self.author_to_index = {}
         self._next_index = 0
         
-        # Pre-defined distinct colors for common authors to ensure consistency
-        self._distinct_colors = [
-            '#1f77b4',  # blue
-            '#ff7f0e',  # orange
-            '#2ca02c',  # green
-            '#d62728',  # red
-            '#9467bd',  # purple
-            '#8c564b',  # brown
-            '#e377c2',  # pink
-            '#7f7f7f',  # gray
-            '#bcbd22',  # olive
-            '#17becf',  # cyan
-            '#a6cee3',  # light blue
-            '#fb9a99',  # light red
-            '#fdbf6f',  # light orange
-            '#cab2d6',  # light purple
-            '#ffff99',  # light yellow
-            '#b15928',  # dark orange
-            '#fb8072',  # salmon
-            '#80b1d3',  # sky blue
-            '#fdb462',  # peach
-            '#b3de69',  # lime green
-        ]
+        # Import PlotStyle for Nordic Ocean author colors
+        from backend.src.utils.plot_styling import PlotStyle
+        
+        # Use Nordic Ocean Extended Theme - Author Colors
+        # These colors are designed to be distinguishable while maintaining
+        # aesthetic harmony with the Nordic Ocean gradient theme
+        self._distinct_colors = PlotStyle.AUTHOR_COLORS.copy()
     
     def get_author_color(self, author: str) -> str:
         """
@@ -678,15 +689,15 @@ class DataLoader:
             activations: 3D numpy array (n_docs, max_seq_len, n_features)
             metadata: ActivationMetadata object
         """
-        meta_path = Path(filepath).with_suffix('.meta.pkl')
-        metadata = ActivationMetadata.load(meta_path)
+        # Pass the activation filename to load the corresponding metadata
+        metadata = ActivationMetadata.load(str(filepath))
         
         if metadata.storage_format == 'dense':
             data_path = Path(filepath).with_suffix('.npz')
             data = np.load(data_path)
             activations = data['activations']
         else:  # sparse
-            data_path = Path(filepath).with_suffix('.sparse.npz')
+            data_path = Path(filepath).with_suffix('.npz')
             sparse_matrix = sp.load_npz(data_path)
             activations = sparse_matrix
             

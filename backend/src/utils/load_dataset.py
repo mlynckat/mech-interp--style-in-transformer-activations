@@ -67,7 +67,7 @@ def load_news_data(dataset_config, category_name, n_docs=None, exclude_authors=N
 
     logger.info("Loading dataset...")
     dir_path = "data/news_authormix_datasets"
-    file_path = os.path.join(dir_path, f"{category_name.upper()}_authormix.json")
+    file_path = os.path.join(dir_path, f"{category_name.upper()}_authormix_cleaned.json")
 
     with open(file_path, "r", encoding="utf-8") as f:
         dataset = json.load(f)
@@ -83,7 +83,7 @@ def load_news_data(dataset_config, category_name, n_docs=None, exclude_authors=N
         author = doc['style']  # 'style' column contains author info
 
         len_doc = len(doc['text'].split())
-        if len_doc < min_length_doc:
+        if min_length_doc is not None and len_doc < min_length_doc:
             continue
 
         if exclude_authors is not None and author in exclude_authors:

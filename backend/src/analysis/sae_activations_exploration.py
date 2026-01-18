@@ -21,6 +21,12 @@ from tqdm.auto import tqdm
 import altair as alt
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# Import and apply plot styling
+from backend.src.utils.plot_styling import PlotStyle, apply_style, create_figure
+
+# Apply global matplotlib styling (Nordic Ocean Theme)
+apply_style()
+
 # Constants
 ACTIVATION_THRESHOLD = 1.0
 BINARY_ACTIVATION_TYPE = np.int8
@@ -158,24 +164,31 @@ class Visualizer:
                linestyle=linestyle, alpha=alpha, label=label)
 
     def _configure_histogram_axes(self, hist_ax: plt.Axes, box_ax: plt.Axes, title_suffix: str) -> None:
-        """Configure histogram and boxplot axes."""
-        # Configure histogram subplot
-        hist_ax.set_title(f"Distribution of Active SAE Features per Token {title_suffix}")
-        hist_ax.set_xlabel("Active SAE features")
-        hist_ax.set_ylabel("Density")
-        hist_ax.legend()
-        hist_ax.grid(True, alpha=0.3)
+        """Configure histogram and boxplot axes with Nordic Ocean styling."""
+        # Configure histogram subplot using PlotStyle
+        PlotStyle.style_axis(
+            hist_ax,
+            title=f"Distribution of Active SAE Features per Token {title_suffix}",
+            xlabel="Active SAE features",
+            ylabel="Density",
+            grid_axis='y'
+        )
+        hist_ax.legend(frameon=False, fontsize=9)
         
-        # Configure boxplot subplot
-        box_ax.set_title(f"Boxplot of Active SAE Features per Token {title_suffix}")
-        box_ax.set_xlabel("Author")
-        box_ax.set_ylabel("Active SAE features")
-        box_ax.grid(True, alpha=0.3)
+        # Configure boxplot subplot using PlotStyle
+        PlotStyle.style_axis(
+            box_ax,
+            title=f"Boxplot of Active SAE Features per Token {title_suffix}",
+            xlabel="Author",
+            ylabel="Active SAE features",
+            grid_axis='y'
+        )
 
     def _save_plot(self, fig: plt.Figure, filename: str) -> None:
-        """Save plot to file and close figure."""
+        """Save plot to file and close figure with Nordic Ocean styling."""
         plt.tight_layout()
-        plt.savefig(self.save_dir / filename, dpi=FIGURE_DPI, bbox_inches='tight')
+        plt.savefig(self.save_dir / filename, dpi=FIGURE_DPI, bbox_inches='tight',
+                    facecolor=PlotStyle.COLORS['bg_white'])
         plt.close()
 
     def create_tsne_plots(self, features_dict: Dict[str, np.ndarray], labels: List[str],
@@ -217,20 +230,22 @@ class Visualizer:
 
     def _plot_tsne_scatter(self, ax: plt.Axes, embeddings: np.ndarray, labels: List[str], 
                           author_palette: Dict, title: str) -> None:
-        """Plot t-SNE scatter plot on given axes."""
+        """Plot t-SNE scatter plot on given axes with Nordic Ocean styling."""
         sns.scatterplot(
             x=embeddings[:, 0], y=embeddings[:, 1],
-        hue=labels, palette=author_palette, s=50, alpha=SCATTER_ALPHA, ax=ax
+            hue=labels, palette=author_palette, s=50, alpha=SCATTER_ALPHA, ax=ax
         )
-        ax.set_title(f't-SNE ({title})', fontsize=10)
+        PlotStyle.style_axis(ax, title=f't-SNE ({title})', grid_axis='both')
 
     def _finalize_tsne_plot(self, fig: plt.Figure, layer_str: str, activation_type: str) -> None:
-        """Finalize t-SNE plot with title and save."""
-        fig.suptitle(f't-SNE of Docs for {activation_type} layer {layer_str}')
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        """Finalize t-SNE plot with title and save using Nordic Ocean styling."""
+        fig.suptitle(f't-SNE of Docs for {activation_type} layer {layer_str}',
+                     fontsize=14, color=PlotStyle.COLORS['text_dark'])
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', frameon=False)
 
         filename = f"clusters_{activation_type}_layer_{layer_str}.png"
-        plt.savefig(self.save_dir / filename)
+        plt.savefig(self.save_dir / filename, dpi=FIGURE_DPI, bbox_inches='tight',
+                    facecolor=PlotStyle.COLORS['bg_white'])
         plt.close()
 
     def create_umap_plots(self, features_dict: Dict[str, np.ndarray], labels: List[str],
@@ -273,40 +288,47 @@ class Visualizer:
 
     def _plot_umap_scatter(self, ax: plt.Axes, embeddings: np.ndarray, labels: List[str], 
                           author_palette: Dict, title: str) -> None:
-        """Plot UMAP scatter plot on given axes."""
+        """Plot UMAP scatter plot on given axes with Nordic Ocean styling."""
         sns.scatterplot(
             x=embeddings[:, 0], y=embeddings[:, 1],
             hue=labels, palette=author_palette, s=50, alpha=SCATTER_ALPHA, ax=ax
         )
-        ax.set_title(f'UMAP ({title})', fontsize=10)
+        PlotStyle.style_axis(ax, title=f'UMAP ({title})', grid_axis='both')
 
     def _finalize_umap_plot(self, fig: plt.Figure, layer_str: str, activation_type: str) -> None:
-        """Finalize UMAP plot with title and save."""
-        fig.suptitle(f'UMAP of Docs for {activation_type} layer {layer_str}')
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        """Finalize UMAP plot with title and save using Nordic Ocean styling."""
+        fig.suptitle(f'UMAP of Docs for {activation_type} layer {layer_str}',
+                     fontsize=14, color=PlotStyle.COLORS['text_dark'])
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', frameon=False)
 
         filename = f"umap_clusters_{activation_type}_layer_{layer_str}.png"
-        plt.savefig(self.save_dir / filename)
+        plt.savefig(self.save_dir / filename, dpi=FIGURE_DPI, bbox_inches='tight',
+                    facecolor=PlotStyle.COLORS['bg_white'])
         plt.close()
 
     def create_heatmap(self, data: pd.DataFrame, title: str, filename: str) -> None:
         """
-        Create and save heatmap visualization.
+        Create and save heatmap visualization with Nordic Ocean styling.
         
         Args:
             data: DataFrame to visualize as heatmap
             title: Title for the plot
             filename: Name of the file to save the plot
         """
-        plt.figure(figsize=DEFAULT_FIGURE_SIZE)
-        sns.heatmap(data, annot=True, fmt=".1f", cmap="Greens")
-        plt.title(title)
-        self._save_plot(plt.gcf(), filename)
+        fig, ax = plt.subplots(figsize=DEFAULT_FIGURE_SIZE)
+        
+        # Use Nordic Ocean gradient colormap
+        nordic_cmap = PlotStyle.create_full_gradient_cmap()
+        sns.heatmap(data, annot=True, fmt=".1f", cmap=nordic_cmap, ax=ax,
+                   cbar_kws={'shrink': 0.8})
+        
+        PlotStyle.style_axis(ax, title=title, grid_axis='')
+        self._save_plot(fig, filename)
 
     def create_distribution_plot(self, data_dict: Dict[str, np.ndarray], title: str,
                                  xlabel: str, ylabel: str, filename: str) -> None:
         """
-        Create overlaid histogram distribution plot.
+        Create overlaid histogram distribution plot with Nordic Ocean styling.
         
         Args:
             data_dict: Dictionary mapping author names to their data arrays
@@ -315,20 +337,18 @@ class Visualizer:
             ylabel: Label for y-axis
             filename: Name of the file to save the plot
         """
-        plt.figure(figsize=DEFAULT_FIGURE_SIZE)
+        fig, ax = plt.subplots(figsize=DEFAULT_FIGURE_SIZE)
         
         authors = list(data_dict.keys())
         author_colors = self.color_manager.get_author_colors(authors)
         
         for author, data in data_dict.items():
-            plt.hist(data, bins=HISTOGRAM_BINS, alpha=SCATTER_ALPHA, 
-                    label=author, color=author_colors[author])
+            ax.hist(data, bins=HISTOGRAM_BINS, alpha=SCATTER_ALPHA, 
+                   label=author, color=author_colors[author])
 
-        plt.title(title)
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.legend()
-        self._save_plot(plt.gcf(), filename)
+        PlotStyle.style_axis(ax, title=title, xlabel=xlabel, ylabel=ylabel, grid_axis='y')
+        ax.legend(frameon=False, fontsize=9)
+        self._save_plot(fig, filename)
 
     def plot_activations_per_feature(self, activations_df: pd.DataFrame, title_suffix: str, plot_filename: str) -> None:
         """
@@ -351,19 +371,32 @@ class Visualizer:
         return chart_df.drop(columns=['feature_counts'], errors='ignore')
 
     def _create_altair_chart(self, chart_df: pd.DataFrame, title_suffix: str) -> alt.Chart:
-        """Create Altair chart for activation visualization."""
+        """Create Altair chart for activation visualization with Nordic Ocean styling."""
         unique_authors = chart_df['variable'].unique().tolist()
         domain, range_colors = self.color_manager.get_altair_domain_range(unique_authors)
         
         return alt.Chart(chart_df).mark_circle(size=60, opacity=SCATTER_ALPHA).encode(
-            x=alt.X('feature_ind:Q', title='Feature Index'),
-            y=alt.Y('value:Q', title='Activation Count'),
-            color=alt.Color('variable:N', title='Author', domain=domain, range=range_colors),
+            x=alt.X('feature_ind:Q', title='Feature Index',
+                   axis=alt.Axis(labelColor=PlotStyle.COLORS['text_medium'],
+                                titleColor=PlotStyle.COLORS['text_dark'])),
+            y=alt.Y('value:Q', title='Activation Count',
+                   axis=alt.Axis(labelColor=PlotStyle.COLORS['text_medium'],
+                                titleColor=PlotStyle.COLORS['text_dark'])),
+            color=alt.Color('variable:N', title='Author', 
+                          scale=alt.Scale(domain=domain, range=range_colors)),
             tooltip=['feature_ind', 'value', 'variable', 'feature_counts_str']
         ).properties(
-            title=f'Feature Activation Counts - {title_suffix}',
+            title=alt.TitleParams(
+                text=f'Feature Activation Counts - {title_suffix}',
+                color=PlotStyle.COLORS['text_dark'],
+                fontSize=14
+            ),
             width=800,
             height=400
+        ).configure_view(
+            strokeWidth=0
+        ).configure_axis(
+            gridColor=PlotStyle.COLORS['grid']
         ).interactive()
 
     def _save_altair_chart(self, chart: alt.Chart, plot_filename: str) -> None:
@@ -415,20 +448,28 @@ class Visualizer:
         
     def _plot_entropy_scatter(self, df: pd.DataFrame, layer_str: str, transformer_part: str, 
                              author: str, entropy_type: str, entropy_label: str) -> None:
-        """Create scatter plot for entropy vs activations."""
-        plt.figure(figsize=DEFAULT_FIGURE_SIZE)
-        plt.scatter(df[entropy_type], df["activations"], alpha=0.2)
-        plt.xlabel(entropy_label)
-        plt.ylabel("Activations")
-        plt.title(f"{entropy_label} vs Activations for {layer_str} {transformer_part} {author}")
+        """Create scatter plot for entropy vs activations with Nordic Ocean styling."""
+        fig, ax = plt.subplots(figsize=DEFAULT_FIGURE_SIZE)
+        
+        # Use primary color from Nordic Ocean palette
+        ax.scatter(df[entropy_type], df["activations"], alpha=0.2,
+                  color=PlotStyle.COLORS['primary'], s=20)
+        
+        PlotStyle.style_axis(
+            ax,
+            title=f"{entropy_label} vs Activations for {layer_str} {transformer_part} {author}",
+            xlabel=entropy_label,
+            ylabel="Activations",
+            grid_axis='both'
+        )
         
         filename = f"{entropy_type}_vs_activations_{layer_str}_{transformer_part}_{author}.png"
-        self._save_plot(plt.gcf(), filename)
+        self._save_plot(fig, filename)
 
     def plot_token_positions(self, token_positions: Dict[int, List[int]], author: str, 
                            transformer_part: str, layer_str: str) -> None:
         """
-        Plot token positions showing activation counts at each token position.
+        Plot token positions showing activation counts at each token position with Nordic Ocean styling.
         
         Args:
             token_positions: Dictionary mapping token indices to lists of activation counts
@@ -436,18 +477,23 @@ class Visualizer:
             transformer_part: Part of the transformer being analyzed
             layer_str: String representation of the layer
         """
-        plt.figure(figsize=DEFAULT_FIGURE_SIZE)
+        fig, ax = plt.subplots(figsize=DEFAULT_FIGURE_SIZE)
         
         for token_ind, activation_counts in token_positions.items():
             x_positions = np.full(len(activation_counts), token_ind)
-            plt.scatter(x_positions, activation_counts, alpha=0.2)
+            ax.scatter(x_positions, activation_counts, alpha=0.2,
+                      color=PlotStyle.COLORS['primary'], s=20)
         
-        plt.title(f"Token positions for {transformer_part} layer {layer_str} {author}")
-        plt.xlabel("Token Index")
-        plt.ylabel("Number of Activations")
+        PlotStyle.style_axis(
+            ax,
+            title=f"Token positions for {transformer_part} layer {layer_str} {author}",
+            xlabel="Token Index",
+            ylabel="Number of Activations",
+            grid_axis='y'
+        )
         
         filename = f"token_positions_{transformer_part}_{layer_str}_{author}.png"
-        self._save_plot(plt.gcf(), filename)
+        self._save_plot(fig, filename)
 
 
 class SAEAnalyzer(BaseAnalyzer):
@@ -486,13 +532,17 @@ class SAEAnalyzer(BaseAnalyzer):
         gc.collect()
         return non_zeroes_count, metadata
 
+    
     def _load_or_compute_activations(self, filename: str) -> Tuple[np.ndarray, ActivationMetadata]:
         """Load precomputed activations or compute them from scratch."""
-        npy_path = self.output_dir / f"non_zeroes_count_{Path(filename).stem}.npy"
+        # Use ActivationMetadata.get_metadata_filename to get the base name
+        base_name = ActivationMetadata.get_metadata_filename(filename).replace('.meta.pkl', '')
+        npy_path = self.output_dir / f"non_zeroes_count_{base_name}.npy"
         
         if npy_path.exists():
             non_zeroes_count = np.load(npy_path)
-            metadata = ActivationMetadata.load(self.data_dir / f"{Path(filename).stem}.meta.pkl")
+            # Pass the activation filename directly
+            metadata = ActivationMetadata.load(str(self.data_dir / filename))
             return non_zeroes_count, metadata
         
         logger.info(f"Computing activations for {filename}")
@@ -602,10 +652,18 @@ class SAEAnalyzer(BaseAnalyzer):
 
     def _create_aggregated_histogram(self, author_data: Dict, activation_type: str, layer_str: str) -> None:
         """Create aggregated histogram for a specific layer and activation type."""
-        df = pd.DataFrame.from_dict(author_data)
-        logger.info(f"Creating histogram for {activation_type} layer {layer_str}: {df.head()}")
+        # Flatten 2D arrays to 1D for DataFrame creation
+        flattened_data = {}
+        for author, activations in author_data.items():
+            if isinstance(activations, np.ndarray):
+                flattened_data[author] = activations.flatten()
+            else:
+                flattened_data[author] = activations
         
-        df_long = df.melt(value_vars=author_data.keys(), var_name='author', value_name='activations')
+        df = pd.DataFrame.from_dict(flattened_data, orient='columns')
+        logger.info(f"Creating histogram for {activation_type} layer {layer_str}: shape={df.shape}")
+        
+        df_long = df.melt(value_vars=flattened_data.keys(), var_name='author', value_name='activations')
         title_suffix = f"Layer {layer_str} {activation_type}"
         hist_filename = f"non_zeroes_hist_aggregated_{activation_type}_{layer_str}.png"
         
@@ -795,7 +853,8 @@ class SAEAnalyzer(BaseAnalyzer):
         
         for activation_type, layer_str_data in filenames.items():
             for layer_str, author_data in layer_str_data.items():
-                for author, filename in author_data.items():
+                for author, filename_base in author_data.items():
+                    filename = self._resolve_filename_extension(filename_base)
                     activations, metadata = self.data_loader.load_sae_activations(self.data_dir / filename)
                     activations_dense = self._process_activations_for_detailed_analysis(activations, metadata)
                     
@@ -937,18 +996,17 @@ class SAEAnalyzer(BaseAnalyzer):
         
         self._generate_entropy_plots(aggregated_activations, entropies, cross_entropies)
 
-    def _load_activations_for_entropy_analysis(self, filenames: List[str]) -> Dict:
+    def _load_activations_for_entropy_analysis(self, filenames: Dict[str, Dict[str, Dict[str, str]]]) -> Dict:
         """Load activations for entropy analysis."""
         aggregated_activations = defaultdict(lambda: defaultdict(dict))
             
-        for filename in filenames:
-            non_zeroes_count, _metadata = self._load_or_compute_activations(filename)
+        for activation_type, layer_str_data in filenames.items():
+            for layer_str, author_data in layer_str_data.items():
+                for author, filename_base in author_data.items():
+                    filename = self._resolve_filename_extension(filename_base)
+                    non_zeroes_count, _metadata = self._load_or_compute_activations(filename)
 
-            parsed = self.filename_parser.parse_filename(filename)
-            self.filename_parser.validate_activation_type(parsed["activation_type"])
-            layer_str = self.filename_parser.format_layer_string(parsed["layer_ind"])
-
-            aggregated_activations[parsed["activation_type"]][layer_str][parsed["author"]] = non_zeroes_count
+                    aggregated_activations[activation_type][layer_str][author] = non_zeroes_count
 
         return aggregated_activations
 
@@ -1000,6 +1058,30 @@ class SAEAnalyzer(BaseAnalyzer):
         """Check if entropy data exists for the given author."""
         return author in entropies and author in cross_entropies
 
+    def _resolve_filename_extension(self, filename_base: str) -> str:
+        """
+        Resolve filename by adding the correct extension (.sparse.npz or .npz).
+        
+        Args:
+            filename_base: Filename without extension
+            
+        Returns:
+            Full filename with extension
+        """
+        # Check for sparse format first
+        sparse_path = self.data_dir / f"{filename_base}.sparse.npz"
+        if sparse_path.exists():
+            return f"{filename_base}.sparse.npz"
+        
+        # Fall back to dense format
+        dense_path = self.data_dir / f"{filename_base}.npz"
+        if dense_path.exists():
+            return f"{filename_base}.npz"
+        
+        # If neither exists, return with .npz extension (will fail later with clear error)
+        logger.warning(f"Could not find file with base name: {filename_base}")
+        return f"{filename_base}.npz"
+    
     def analyze_token_positions(self, filenames: List[str]) -> None:
         """
         Analyze token positions and their activation patterns.
@@ -1009,13 +1091,19 @@ class SAEAnalyzer(BaseAnalyzer):
         """
         token_positions = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list))))
 
-        for filename in filenames:
-            non_zeroes_count = self._load_or_compute_activations(filename)
-            parsed = self.filename_parser.parse_filename(filename)
-            self.filename_parser.validate_activation_type(parsed["activation_type"])
-            layer_str = self.filename_parser.format_layer_string(parsed["layer_ind"])
+        for activation_type, layer_ind_dict  in filenames.items():
+            for layer_ind, author_dict in layer_ind_dict.items():
+                for author, filename_base in author_dict.items():
+                    # Add extension back - check which extension exists
+                    filename = self._resolve_filename_extension(filename_base)
+                    logger.info(f"Processing: {activation_type} {layer_ind} {author} - resolved to: {filename}")
+                    
+                    non_zeroes_count, _ = self._load_or_compute_activations(filename)
+                    parsed = self.filename_parser.parse_filename(filename)
+                    self.filename_parser.validate_activation_type(parsed["activation_type"])
+                    layer_str = self.filename_parser.format_layer_string(parsed["layer_ind"])
 
-            self._extract_token_positions(non_zeroes_count, parsed, layer_str, token_positions)
+                    self._extract_token_positions(non_zeroes_count, parsed, layer_str, token_positions)
 
         self._generate_token_position_plots(token_positions)
 
@@ -1092,7 +1180,7 @@ def _parse_arguments() -> argparse.Namespace:
         "--mode",
         type=str,
         choices=["explore", "cluster", "detailed", "entropies", "token_positions", "all"],
-        default="cluster",
+        default="entropies",
         help="Analysis mode: explore, cluster, detailed, entropies, token_positions, or all"
     )
     parser.add_argument(
@@ -1139,8 +1227,9 @@ def _analyze_single_file(analyzer: SAEAnalyzer, filename: str) -> None:
 def _analyze_multiple_files(analyzer: SAEAnalyzer, data_dir: Path, args: argparse.Namespace) -> None:
     """Analyze multiple files based on mode."""
     filenames = _load_filenames(data_dir, args)
+
     logger.info(f"Loaded {len(filenames)} files") 
-    print(filenames)              
+           
     
     if args.mode in ["explore", "all"]:
         analyzer.analyze_all_files(filenames)

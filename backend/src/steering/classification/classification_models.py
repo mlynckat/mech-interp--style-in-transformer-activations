@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import pandas as pd
 from pathlib import Path
 import numpy as np
@@ -25,13 +25,24 @@ class BaseModel(ABC):
         self.is_fitted = False
     
     @abstractmethod
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> 'BaseModel':
-        """Train the model"""
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        X_val: Optional[pd.DataFrame] = None,
+        y_val: Optional[pd.Series] = None,
+    ) -> 'BaseModel':
+        """Train the model. Validation data is optional for models that need it."""
         pass
     
     @abstractmethod
     def predict(self, X: pd.DataFrame) -> pd.Series:
         """Make predictions"""
+        pass
+    
+    @abstractmethod
+    def predict_proba(self, X: pd.DataFrame) -> pd.Series:
+        """Return probability of class 1"""
         pass
     
     @abstractmethod
@@ -50,7 +61,13 @@ class LogisticRegressionModel(BaseModel):
         self.model = LogisticRegression(**kwargs)
         self.model_path = path_to_models / f"{author}_{data_transformer.__class__.__name__}_logistic_regression_model.pkl"
     
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> 'LogisticRegressionModel':
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        X_val: Optional[pd.DataFrame] = None,
+        y_val: Optional[pd.Series] = None,
+    ) -> 'LogisticRegressionModel':
         self.model.fit(X, y)
         self.is_fitted = True
         self.save_model()
@@ -58,8 +75,15 @@ class LogisticRegressionModel(BaseModel):
     
     def predict(self, X: pd.DataFrame) -> pd.Series:
         predictions = self.model.predict(X)
-        
-        return pd.Series(predictions)
+        # Some transformers (e.g., TF-IDF) return matrices without an index
+        index = getattr(X, "index", None)
+        return pd.Series(predictions, index=index)
+    
+    def predict_proba(self, X: pd.DataFrame) -> pd.Series:
+        """Return probability of class 1"""
+        probas = self.model.predict_proba(X)
+        index = getattr(X, "index", None)
+        return pd.Series(probas[:, 1], index=index)
     
     def get_metrics(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
         y_pred = self.predict(X)
@@ -93,7 +117,13 @@ class RandomForestModel(BaseModel):
         with open(self.model_path, 'rb') as fin:
             self.model = pickle.load(fin)
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> 'RandomForestModel':
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        X_val: Optional[pd.DataFrame] = None,
+        y_val: Optional[pd.Series] = None,
+    ) -> 'RandomForestModel':
         self.model.fit(X, y)
         self.is_fitted = True
         self.save_model()
@@ -103,6 +133,11 @@ class RandomForestModel(BaseModel):
         predictions = self.model.predict(X)
 
         return pd.Series(predictions)
+    
+    def predict_proba(self, X: pd.DataFrame) -> pd.Series:
+        """Return probability of class 1"""
+        probas = self.model.predict_proba(X)
+        return pd.Series(probas[:, 1])
     
     def get_metrics(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
         y_pred = self.predict(X)
@@ -130,7 +165,13 @@ class SGDClassifierModel(BaseModel):
             self.model = pickle.load(fin)
         return self.model
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> 'SGDClassifierModel':
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        X_val: Optional[pd.DataFrame] = None,
+        y_val: Optional[pd.Series] = None,
+    ) -> 'SGDClassifierModel':
         self.model.fit(X, y)
         self.is_fitted = True
         self.save_model()
@@ -139,6 +180,18 @@ class SGDClassifierModel(BaseModel):
     def predict(self, X: pd.DataFrame) -> pd.Series:
         predictions = self.model.predict(X)
         return pd.Series(predictions)
+    
+    def predict_proba(self, X: pd.DataFrame) -> pd.Series:
+        """Return probability of class 1. Note: requires loss='log_loss' during training."""
+        if hasattr(self.model, 'predict_proba'):
+            probas = self.model.predict_proba(X)
+            return pd.Series(probas[:, 1])
+        else:
+            # Fall back to decision function if predict_proba not available
+            scores = self.model.decision_function(X)
+            # Apply sigmoid to convert to probability-like values
+            probas = 1 / (1 + np.exp(-scores))
+            return pd.Series(probas)
     
     def get_metrics(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
         y_pred = self.predict(X)
@@ -156,7 +209,7 @@ class ModernBertClassifierModel(BaseModel):
         super().__init__(**kwargs)
         model_id = "answerdotai/ModernBERT-base"
         num_labels = 2
-        label2id = {0: "other", 1: author}
+        label2id = {"other": 0, author: 1}
         id2label = {0: "other", 1: author}
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_id,
@@ -165,11 +218,12 @@ class ModernBertClassifierModel(BaseModel):
             id2label=id2label
             )
         self.tokenizer = data_transformer.tokenizer
-        self.model_path = path_to_models / f"{author}_{data_transformer.__class__.__name__}_modern_bert_classifier_model"
+        self.model_path = path_to_models / f"{author}_{data_transformer.__class__.__name__}_modern_bert_classifier"
         
  
     def transform_data_for_trainer(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
-        """Transforms Dataframe and Series to Dicts of Lists like {"labels": [], "input_ids": [], "attention_mask": [], "token_type_ids": []}"""
+        """Transforms Dataframe and Series to Dicts of Lists for HuggingFace Trainer.
+        """
 
         # First make sure that indexes are the same
         if X.index.tolist() != y.index.tolist():
@@ -181,7 +235,6 @@ class ModernBertClassifierModel(BaseModel):
                 "labels": y[i],  # Labels should be scalar for classification
                 "input_ids": row["input_ids"],  # Already a list from tokenizer
                 "attention_mask": row["attention_mask"],  # Already a list from tokenizer
-                "token_type_ids": row["token_type_ids"],  # Already a list from tokenizer
             })
         print(data[0])
         return data
@@ -209,7 +262,7 @@ class ModernBertClassifierModel(BaseModel):
             per_device_train_batch_size=32,
             per_device_eval_batch_size=16,
             learning_rate=5e-5,
-                num_train_epochs=5,
+            num_train_epochs=10,
             bf16=True, # bfloat16 training 
             optim="adamw_torch_fused", # improved optimizer 
             # logging & evaluation strategies
@@ -254,12 +307,41 @@ class ModernBertClassifierModel(BaseModel):
         # Get predictions
         self.model.eval()
         with torch.no_grad():
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = self.model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask
+            )
         
         # Get predicted class IDs
         predicted_ids = outputs.logits.argmax(-1).cpu().numpy()
         
         return pd.Series(predicted_ids, index=X.index)
+    
+    def predict_proba(self, X: pd.DataFrame) -> pd.Series:
+        """Return probability of class 1"""
+        # Convert DataFrame columns to tensors
+        input_ids = torch.tensor(X['input_ids'].tolist())
+        attention_mask = torch.tensor(X['attention_mask'].tolist())
+        
+        # Move to device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device)
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        
+        # Get predictions
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask
+            )
+        
+        # Apply softmax to get probabilities
+        probas = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+        
+        # Return probability of class 1
+        return pd.Series(probas[:, 1], index=X.index)
     
     def compute_metrics(self, eval_pred) -> Dict[str, float]:
         """Compute metrics for Trainer. eval_pred is a tuple of (predictions, labels)."""
